@@ -641,27 +641,30 @@ mergePathKernel(KeyIteratorIn keys1,
 
 template <typename KeyT, typename ValueT, typename NumItemsT, typename OffsetT, typename CountT>
 void
-radixSortAsync(KeyT *keysIn,
-               KeyT *keysOut,
-               ValueT *valuesIn,
-               ValueT *valuesOut,
+radixSortAsync(cub::DoubleBuffer<KeyT> &keys,
+               cub::DoubleBuffer<ValueT> &values,
                NumItemsT numItems,
                int beginBit,
                int endBit,
                OffsetT *mergeIntervals,
                const OffsetT *offsets,
-               const CountT *counts,
-               cudaEvent_t *events) {
+               const CountT *counts) {
+    std::vector<cudaEvent_t> events(c10::cuda::device_count());
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        cudaEventCreate(&events[deviceId], cudaEventDisableTiming);
+    }
+
     // Radix sort the subset of keys assigned to each device in parallel
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-        C10_CUDA_CHECK(cudaEventSynchronize(events[deviceId]));
+        // C10_CUDA_CHECK(cudaEventSynchronize(events[deviceId]));
 
-        const KeyT *deviceKeysIn     = keysIn + offsets[deviceId];
-        const ValueT *deviceValuesIn = valuesIn + offsets[deviceId];
-        KeyT *deviceKeysOut          = keysOut + offsets[deviceId];
-        ValueT *deviceValuesOut      = valuesOut + offsets[deviceId];
+        KeyT *deviceKeysIn      = keys.Current() + offsets[deviceId];
+        ValueT *deviceValuesIn  = values.Current() + offsets[deviceId];
+        KeyT *deviceKeysOut     = keys.Alternate() + offsets[deviceId];
+        ValueT *deviceValuesOut = values.Alternate() + offsets[deviceId];
 
         C10_CUDA_CHECK(nanovdb::util::cuda::memPrefetchAsync(
             deviceKeysIn, counts[deviceId] * sizeof(KeyT), deviceId, stream));
@@ -672,16 +675,41 @@ radixSortAsync(KeyT *keysIn,
         C10_CUDA_CHECK(nanovdb::util::cuda::memPrefetchAsync(
             deviceValuesOut, counts[deviceId] * sizeof(ValueT), deviceId, stream));
 
-        CUB_WRAPPER(cub::DeviceRadixSort::SortPairs,
-                    deviceKeysIn,
-                    deviceKeysOut,
-                    deviceValuesIn,
-                    deviceValuesOut,
-                    counts[deviceId],
-                    beginBit,
-                    endBit,
-                    stream);
+        cub::DoubleBuffer<KeyT> deviceKeys(deviceKeysIn, deviceKeysOut);
+        cub::DoubleBuffer<ValueT> deviceValues(deviceValuesIn, deviceValuesOut);
+
+        void *dTempStorage      = nullptr;
+        size_t tempStorageBytes = 0;
+        cub::DeviceRadixSort::SortPairs(dTempStorage,
+                                        tempStorageBytes,
+                                        deviceKeys,
+                                        deviceValues,
+                                        counts[deviceId],
+                                        beginBit,
+                                        endBit,
+                                        stream);
+        cudaMallocAsync(&dTempStorage, tempStorageBytes, stream);
+        cub::DeviceRadixSort::SortPairs(dTempStorage,
+                                        tempStorageBytes,
+                                        deviceKeys,
+                                        deviceValues,
+                                        counts[deviceId],
+                                        beginBit,
+                                        endBit,
+                                        stream);
+        cudaFreeAsync(dTempStorage, stream);
         C10_CUDA_CHECK(cudaEventRecord(events[deviceId], stream));
+
+        // According to the documentation, the selector is a function of the number of keys bits and
+        // the target architecture. Thus, we should expect, require, and assert that the selector is
+        // consistent across each segment of the DoubleBuffer.
+        if (deviceId == 0) {
+            keys.selector   = deviceKeys.selector;
+            values.selector = deviceValues.selector;
+        } else {
+            TORCH_CHECK(keys.selector == deviceKeys.selector);
+            TORCH_CHECK(values.selector == deviceValues.selector);
+        }
     }
 
     // TODO: Generalize to numbers of GPUs that aren't powers of two
@@ -693,8 +721,6 @@ radixSortAsync(KeyT *keysIn,
     OffsetT *leftIntervals    = mergeIntervals;
     OffsetT *rightIntervals   = mergeIntervals + c10::cuda::device_count();
     for (int deviceExponent = 0; deviceExponent < log2DeviceCount; ++deviceExponent) {
-        std::swap(keysIn, keysOut);
-        std::swap(valuesIn, valuesOut);
         const int deviceInc   = 1 << deviceExponent;
         const int deviceCount = static_cast<int>(c10::cuda::device_count());
 
@@ -709,11 +735,12 @@ radixSortAsync(KeyT *keysIn,
             for (int deviceId = rightDeviceId; deviceId < rightDeviceId + deviceInc; ++deviceId)
                 rightDeviceItemCount += counts[deviceId];
 
-            const KeyT *leftDeviceKeysIn     = keysIn + offsets[leftDeviceId];
-            const ValueT *leftDeviceValuesIn = valuesIn + offsets[leftDeviceId];
-            const KeyT *rightDeviceKeysIn    = keysIn + offsets[leftDeviceId] + leftDeviceItemCount;
+            const KeyT *leftDeviceKeysIn     = keys.Current() + offsets[leftDeviceId];
+            const ValueT *leftDeviceValuesIn = values.Current() + offsets[leftDeviceId];
+            const KeyT *rightDeviceKeysIn =
+                keys.Current() + offsets[leftDeviceId] + leftDeviceItemCount;
             const ValueT *rightDeviceValuesIn =
-                valuesIn + offsets[leftDeviceId] + leftDeviceItemCount;
+                values.Current() + offsets[leftDeviceId] + leftDeviceItemCount;
 
             // Wait on the prior sort to finish on both devices before computing the median across
             // both devices
@@ -748,11 +775,12 @@ radixSortAsync(KeyT *keysIn,
             for (int deviceId = rightDeviceId; deviceId < rightDeviceId + deviceInc; ++deviceId)
                 rightDeviceItemCount += counts[deviceId];
 
-            const KeyT *leftDeviceKeysIn     = keysIn + offsets[leftDeviceId];
-            const ValueT *leftDeviceValuesIn = valuesIn + offsets[leftDeviceId];
-            const KeyT *rightDeviceKeysIn    = keysIn + offsets[leftDeviceId] + leftDeviceItemCount;
+            const KeyT *leftDeviceKeysIn     = keys.Current() + offsets[leftDeviceId];
+            const ValueT *leftDeviceValuesIn = values.Current() + offsets[leftDeviceId];
+            const KeyT *rightDeviceKeysIn =
+                keys.Current() + offsets[leftDeviceId] + leftDeviceItemCount;
             const ValueT *rightDeviceValuesIn =
-                valuesIn + offsets[leftDeviceId] + leftDeviceItemCount;
+                values.Current() + offsets[leftDeviceId] + leftDeviceItemCount;
 
             C10_CUDA_CHECK(cudaEventSynchronize(events[leftDeviceId]));
             C10_CUDA_CHECK(cudaEventSynchronize(events[rightDeviceId]));
@@ -786,12 +814,13 @@ radixSortAsync(KeyT *keysIn,
                         rightValuesIn, rightCount * sizeof(ValueT), leftDeviceId, leftStream));
                 }
                 if (auto outputCount = leftCount + rightCount) {
-                    C10_CUDA_CHECK(nanovdb::util::cuda::memPrefetchAsync(keysOut + outputOffset,
-                                                                         outputCount * sizeof(KeyT),
-                                                                         leftDeviceId,
-                                                                         leftStream));
                     C10_CUDA_CHECK(
-                        nanovdb::util::cuda::memPrefetchAsync(valuesOut + outputOffset,
+                        nanovdb::util::cuda::memPrefetchAsync(keys.Alternate() + outputOffset,
+                                                              outputCount * sizeof(KeyT),
+                                                              leftDeviceId,
+                                                              leftStream));
+                    C10_CUDA_CHECK(
+                        nanovdb::util::cuda::memPrefetchAsync(values.Alternate() + outputOffset,
                                                               outputCount * sizeof(ValueT),
                                                               leftDeviceId,
                                                               leftStream));
@@ -804,8 +833,8 @@ radixSortAsync(KeyT *keysIn,
                             rightKeysIn,
                             rightValuesIn,
                             rightCount,
-                            keysOut + outputOffset,
-                            valuesOut + outputOffset,
+                            keys.Alternate() + outputOffset,
+                            values.Alternate() + outputOffset,
                             {},
                             leftStream);
                 C10_CUDA_CHECK(cudaEventRecord(events[leftDeviceId], leftStream));
@@ -840,12 +869,13 @@ radixSortAsync(KeyT *keysIn,
                         rightValuesIn, rightCount * sizeof(ValueT), rightDeviceId, rightStream));
                 }
                 if (auto outputCount = leftCount + rightCount) {
-                    C10_CUDA_CHECK(nanovdb::util::cuda::memPrefetchAsync(keysOut + outputOffset,
-                                                                         outputCount * sizeof(KeyT),
-                                                                         rightDeviceId,
-                                                                         rightStream));
                     C10_CUDA_CHECK(
-                        nanovdb::util::cuda::memPrefetchAsync(valuesOut + outputOffset,
+                        nanovdb::util::cuda::memPrefetchAsync(keys.Alternate() + outputOffset,
+                                                              outputCount * sizeof(KeyT),
+                                                              rightDeviceId,
+                                                              rightStream));
+                    C10_CUDA_CHECK(
+                        nanovdb::util::cuda::memPrefetchAsync(values.Alternate() + outputOffset,
                                                               outputCount * sizeof(ValueT),
                                                               rightDeviceId,
                                                               rightStream));
@@ -858,8 +888,8 @@ radixSortAsync(KeyT *keysIn,
                             rightKeysIn,
                             rightValuesIn,
                             rightCount,
-                            keysOut + outputOffset,
-                            valuesOut + outputOffset,
+                            keys.Alternate() + outputOffset,
+                            values.Alternate() + outputOffset,
                             {},
                             rightStream);
                 C10_CUDA_CHECK(cudaEventRecord(events[rightDeviceId], rightStream));
@@ -871,31 +901,17 @@ radixSortAsync(KeyT *keysIn,
             C10_CUDA_CHECK(cudaEventSynchronize(events[leftDeviceId]));
             C10_CUDA_CHECK(cudaEventSynchronize(events[rightDeviceId]));
         }
+
+        // Each level merges from the current to alternate buffer so we need to update the selector
+        keys.selector ^= 1;
+        values.selector ^= 1;
     }
 
-    // There is no merging required for a single device so we simply copy the sorted result to the
-    // destination array (where the sort would have been merged to).
-    if (log2DeviceCount % 2) {
-        std::swap(keysIn, keysOut);
-        std::swap(valuesIn, valuesOut);
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-
-            cudaMemcpyAsync(keysOut + offsets[deviceId],
-                            keysIn + offsets[deviceId],
-                            counts[deviceId] * sizeof(KeyT),
-                            cudaMemcpyDefault,
-                            stream);
-            cudaMemcpyAsync(valuesOut + offsets[deviceId],
-                            valuesIn + offsets[deviceId],
-                            counts[deviceId] * sizeof(ValueT),
-                            cudaMemcpyDefault,
-                            stream);
-
-            cudaEventRecord(events[deviceId], stream);
-        }
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        cudaEventDestroy(events[deviceId]);
     }
+
+    mergeStreams();
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
@@ -1033,33 +1049,13 @@ gaussianTileIntersectionPrivateUse1Impl(
         torch::Tensor intersectionValues =
             torch::empty({totalIntersections}, means2d.options().dtype(torch::kInt32));
 
-        // Allocate tensors to store the sorted intersections
-        torch::Tensor keysSorted = torch::empty_like(intersectionKeys);
-        torch::Tensor valsSorted = torch::empty_like(intersectionValues);
-
-        torch::Tensor deviceIntersectionOffsets =
-            torch::empty({c10::cuda::device_count()}, means2d.options().dtype(torch::kInt64));
-        torch::Tensor deviceIntersectionCounts =
-            torch::empty({c10::cuda::device_count()}, means2d.options().dtype(torch::kInt64));
-        torch::Tensor mergeIntervals =
-            torch::empty({2 * c10::cuda::device_count()}, means2d.options().dtype(torch::kInt64));
-
-        std::vector<cudaEvent_t> events(c10::cuda::device_count());
-
-        // Compute a joffsets tensor that stores the offsets into the sorted Gaussian
-        // intersections
-        torch::Tensor tileJOffsets = torch::empty({numCameras, numTilesH, numTilesW},
-                                                  means2d.options().dtype(torch::kInt32));
-
         // Compute the set of intersections between each projected Gaussian and each tile,
         // store them in intersectionKeys and intersectionValues
         // where intersectionKeys encodes (camera_id, tile_id, depth) and intersectionValues
         // encodes the index of the Gaussian in the input arrays.
-
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-            cudaEventCreate(&events[deviceId], cudaEventDisableTiming);
 
             int64_t deviceGaussianOffset, deviceGaussianCount;
             std::tie(deviceGaussianOffset, deviceGaussianCount) =
@@ -1084,78 +1080,83 @@ gaussianTileIntersectionPrivateUse1Impl(
                                                          intersectionKeys.data_ptr<int64_t>(),
                                                          intersectionValues.data_ptr<int32_t>());
             C10_CUDA_KERNEL_LAUNCH_CHECK();
-            C10_CUDA_CHECK(cudaEventRecord(events[deviceId], stream));
         }
+        mergeStreams();
 
+        // Sort the intersections by their key so intersections within the same tile are grouped
+        // together and sorted by their depth (near to far).
+        torch::Tensor intersectionOffsets =
+            torch::empty({c10::cuda::device_count()}, means2d.options().dtype(torch::kInt64));
+        torch::Tensor intersectionCounts =
+            torch::empty({c10::cuda::device_count()}, means2d.options().dtype(torch::kInt64));
         {
-            C10_CUDA_CHECK(cudaSetDevice(0));
-            auto stream = c10::cuda::getCurrentCUDAStream(0);
+            // Allocate tensors to store the sorted intersections
+            torch::Tensor keysSorted     = torch::empty_like(intersectionKeys);
+            torch::Tensor valsSorted     = torch::empty_like(intersectionValues);
+            torch::Tensor mergeIntervals = torch::empty({2 * c10::cuda::device_count()},
+                                                        means2d.options().dtype(torch::kInt64));
+
+            // https://nvidia.github.io/cccl/cub/api/structcub_1_1DeviceRadixSort.html
+            // DoubleBuffer reduce the auxiliary memory usage from O(N+P) to O(P)
+            // Create a set of DoubleBuffers to wrap pairs of device pointers
+
             for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-                C10_CUDA_CHECK(cudaStreamWaitEvent(stream, events[deviceId]));
+                std::tie(intersectionOffsets.data_ptr<int64_t>()[deviceId],
+                         intersectionCounts.data_ptr<int64_t>()[deviceId]) =
+                    deviceChunk(totalIntersections, deviceId);
             }
-            C10_CUDA_CHECK(cudaEventRecord(events[0], stream));
-        }
 
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, events[0]));
-            std::tie(deviceIntersectionOffsets.data_ptr<int64_t>()[deviceId],
-                     deviceIntersectionCounts.data_ptr<int64_t>()[deviceId]) =
-                deviceChunk(totalIntersections, deviceId);
-        }
+            cub::DoubleBuffer<int64_t> d_keys(intersectionKeys.data_ptr<int64_t>(),
+                                              keysSorted.data_ptr<int64_t>());
+            cub::DoubleBuffer<int32_t> d_vals(intersectionValues.data_ptr<int32_t>(),
+                                              valsSorted.data_ptr<int32_t>());
 
-        const int32_t numBits = 32 + numCamIdBits + numTileIdBits;
-        radixSortAsync(intersectionKeys.data_ptr<int64_t>(),
-                       keysSorted.data_ptr<int64_t>(),
-                       intersectionValues.data_ptr<int32_t>(),
-                       valsSorted.data_ptr<int32_t>(),
-                       totalIntersections,
-                       0,
-                       numBits,
-                       mergeIntervals.data_ptr<int64_t>(),
-                       deviceIntersectionOffsets.const_data_ptr<int64_t>(),
-                       deviceIntersectionCounts.const_data_ptr<int64_t>(),
-                       events.data());
+            const int32_t numBits = 32 + numCamIdBits + numTileIdBits;
+            radixSortAsync(d_keys,
+                           d_vals,
+                           totalIntersections,
+                           0,
+                           numBits,
+                           mergeIntervals.data_ptr<int64_t>(),
+                           intersectionOffsets.const_data_ptr<int64_t>(),
+                           intersectionCounts.const_data_ptr<int64_t>());
 
-        {
-            C10_CUDA_CHECK(cudaSetDevice(0));
-            auto stream = c10::cuda::getCurrentCUDAStream(0);
-            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-                C10_CUDA_CHECK(cudaStreamWaitEvent(stream, events[deviceId]));
+            // DoubleBuffer swaps the pointers if the keys were sorted in the input buffer
+            // so we need to grab the right buffer.
+            if (d_keys.selector == 1) {
+                intersectionKeys = keysSorted;
             }
-            C10_CUDA_CHECK(cudaEventRecord(events[0], stream));
+            if (d_vals.selector == 1) {
+                intersectionValues = valsSorted;
+            }
         }
 
         TORCH_CHECK(!isSparse, "Sparse tile offsets are not implemented for mGPU");
-
+        // Compute a joffsets tensor that stores the offsets into the sorted Gaussian
+        // intersections
+        torch::Tensor tileJOffsets = torch::empty({numCameras, numTilesH, numTilesW},
+                                                  means2d.options().dtype(torch::kInt32));
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, events[0]));
 
             const int NUM_BLOCKS_2 =
-                (deviceIntersectionCounts.const_data_ptr<int64_t>()[deviceId] + NUM_THREADS - 1) /
+                (intersectionCounts.const_data_ptr<int64_t>()[deviceId] + NUM_THREADS - 1) /
                 NUM_THREADS;
             computeTileOffsets<<<NUM_BLOCKS_2, NUM_THREADS, 0, stream>>>(
-                deviceIntersectionOffsets.const_data_ptr<int64_t>()[deviceId],
-                deviceIntersectionCounts.const_data_ptr<int64_t>()[deviceId],
+                intersectionOffsets.const_data_ptr<int64_t>()[deviceId],
+                intersectionCounts.const_data_ptr<int64_t>()[deviceId],
                 totalIntersections,
                 numCameras,
                 totalTiles,
                 numTileIdBits,
-                keysSorted.data_ptr<int64_t>(),
+                intersectionKeys.data_ptr<int64_t>(),
                 tileJOffsets.data_ptr<int32_t>());
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
-
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            cudaEventDestroy(events[deviceId]);
-        }
-
         mergeStreams();
 
-        return std::make_tuple(tileJOffsets, valsSorted);
+        return std::make_tuple(tileJOffsets, intersectionValues);
     }
 }
 
