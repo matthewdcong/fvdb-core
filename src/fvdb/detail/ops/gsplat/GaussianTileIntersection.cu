@@ -678,26 +678,13 @@ radixSortAsync(cub::DoubleBuffer<KeyT> &keys,
         cub::DoubleBuffer<KeyT> deviceKeys(deviceKeysIn, deviceKeysOut);
         cub::DoubleBuffer<ValueT> deviceValues(deviceValuesIn, deviceValuesOut);
 
-        void *dTempStorage      = nullptr;
-        size_t tempStorageBytes = 0;
-        cub::DeviceRadixSort::SortPairs(dTempStorage,
-                                        tempStorageBytes,
-                                        deviceKeys,
-                                        deviceValues,
-                                        counts[deviceId],
-                                        beginBit,
-                                        endBit,
-                                        stream);
-        cudaMallocAsync(&dTempStorage, tempStorageBytes, stream);
-        cub::DeviceRadixSort::SortPairs(dTempStorage,
-                                        tempStorageBytes,
-                                        deviceKeys,
-                                        deviceValues,
-                                        counts[deviceId],
-                                        beginBit,
-                                        endBit,
-                                        stream);
-        cudaFreeAsync(dTempStorage, stream);
+        CUB_WRAPPER(cub::DeviceRadixSort::SortPairs,
+                    deviceKeys,
+                    deviceValues,
+                    counts[deviceId],
+                    beginBit,
+                    endBit,
+                    stream);
         C10_CUDA_CHECK(cudaEventRecord(events[deviceId], stream));
 
         // According to the documentation, the selector is a function of the number of keys bits and
