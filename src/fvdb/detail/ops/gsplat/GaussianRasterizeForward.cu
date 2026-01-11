@@ -291,6 +291,29 @@ getSharedMemRequirements(const size_t tileSize) {
     return tileSize * tileSize * sizeof(Gaussian2D<ScalarType>);
 }
 
+void memPrefetchAsync(const torch::Tensor& self)
+{
+    if (!self.is_privateuseone())
+        return;
+
+    size_t nbytes =
+        at::detail::computeStorageNbytes(self.sizes(), self.strides(), self.itemsize(), self.storage_offset());
+
+    for (const auto deviceId : c10::irange(c10::cuda::device_count()))
+    {
+        size_t device_offset, device_nbytes;
+        std::tie(device_offset, device_nbytes) = deviceChunk(nbytes, deviceId);
+        if (device_nbytes > 0)
+        {
+            C10_CUDA_CHECK(cudaSetDevice(deviceId));
+            cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
+            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(static_cast<const uint8_t*>(self.storage().data()) + device_offset,
+                                            device_nbytes, location, 0, stream));
+        }
+    }
+}
+
 template <typename ScalarType, uint32_t NUM_CHANNELS, bool IS_PACKED>
 std::tuple<fvdb::JaggedTensor, fvdb::JaggedTensor, fvdb::JaggedTensor>
 launchRasterizeForwardKernel(
@@ -485,6 +508,26 @@ launchRasterizeForwardKernels(
         std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
 
         if (deviceTileCount) {
+            TORCH_CHECK(means2d.is_contiguous());
+            TORCH_CHECK(conics.is_contiguous());
+            TORCH_CHECK(opacities.is_contiguous());
+            TORCH_CHECK(features.is_contiguous());
+
+            TORCH_CHECK(outFeatures.jdata().is_contiguous());
+            TORCH_CHECK(outAlphas.jdata().is_contiguous());
+            TORCH_CHECK(outLastIds.jdata().is_contiguous());
+
+            memPrefetchAsync(means2d);
+            memPrefetchAsync(conics);
+            memPrefetchAsync(opacities);
+            memPrefetchAsync(features);
+            memPrefetchAsync(tileOffsets);
+            memPrefetchAsync(tileGaussianIds);
+
+            memPrefetchAsync(outFeatures.jdata());
+            memPrefetchAsync(outAlphas.jdata());
+            memPrefetchAsync(outLastIds.jdata());
+
             auto args = RasterizeForwardArgs<ScalarType, NUM_CHANNELS, IS_PACKED>(means2d,
                                                                                   conics,
                                                                                   opacities,
@@ -506,28 +549,6 @@ launchRasterizeForwardKernels(
                                                                                   tilePixelMask,
                                                                                   tilePixelCumsum,
                                                                                   pixelMap);
-
-            TORCH_CHECK(means2d.is_contiguous());
-            TORCH_CHECK(conics.is_contiguous());
-            TORCH_CHECK(opacities.is_contiguous());
-            TORCH_CHECK(features.is_contiguous());
-
-            nanovdb::util::cuda::memPrefetchAsync(means2d.const_data_ptr<ScalarType>(),
-                                                  means2d.numel() * sizeof(ScalarType),
-                                                  deviceId,
-                                                  stream);
-            nanovdb::util::cuda::memPrefetchAsync(conics.const_data_ptr<ScalarType>(),
-                                                  conics.numel() * sizeof(ScalarType),
-                                                  deviceId,
-                                                  stream);
-            nanovdb::util::cuda::memPrefetchAsync(opacities.const_data_ptr<ScalarType>(),
-                                                  opacities.numel() * sizeof(ScalarType),
-                                                  deviceId,
-                                                  stream);
-            nanovdb::util::cuda::memPrefetchAsync(features.const_data_ptr<ScalarType>(),
-                                                  features.numel() * sizeof(ScalarType),
-                                                  deviceId,
-                                                  stream);
 
             // Thread blocks cooperatively cache a tile of Gaussians in shared memory
             const uint32_t sharedMem = getSharedMemRequirements<ScalarType>(tileSize);
