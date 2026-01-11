@@ -291,6 +291,31 @@ getSharedMemRequirements(const size_t tileSize) {
     return tileSize * tileSize * sizeof(Gaussian2D<ScalarType>);
 }
 
+void
+memPrefetchAsync(const torch::Tensor &self) {
+    if (!self.is_privateuseone())
+        return;
+
+    size_t nbytes = at::detail::computeStorageNbytes(
+        self.sizes(), self.strides(), self.itemsize(), self.storage_offset());
+
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        size_t device_offset, device_nbytes;
+        std::tie(device_offset, device_nbytes) = deviceChunk(nbytes, deviceId);
+        if (device_nbytes > 0) {
+            C10_CUDA_CHECK(cudaSetDevice(deviceId));
+            cudaMemLocation location = {cudaMemLocationTypeDevice, deviceId};
+            auto stream              = c10::cuda::getCurrentCUDAStream(deviceId);
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(
+                static_cast<const uint8_t *>(self.storage().data()) + device_offset,
+                device_nbytes,
+                location,
+                0,
+                stream));
+        }
+    }
+}
+
 template <typename ScalarType, uint32_t NUM_CHANNELS, bool IS_PACKED>
 std::tuple<fvdb::JaggedTensor, fvdb::JaggedTensor, fvdb::JaggedTensor>
 launchRasterizeForwardKernel(
@@ -478,6 +503,14 @@ launchRasterizeForwardKernels(
     auto outFeatures = fvdb::JaggedTensor(featuresToRenderVec);
     auto outAlphas   = fvdb::JaggedTensor(alphasToRenderVec);
     auto outLastIds  = fvdb::JaggedTensor(lastIdsToRenderVec);
+
+    TORCH_CHECK(outFeatures.jdata().is_contiguous());
+    TORCH_CHECK(outAlphas.jdata().is_contiguous());
+    TORCH_CHECK(outLastIds.jdata().is_contiguous());
+
+    memPrefetchAsync(outFeatures.jdata());
+    memPrefetchAsync(outAlphas.jdata());
+    memPrefetchAsync(outLastIds.jdata());
 
     auto isSparse      = activeTiles.has_value();
     uint32_t tileCount = isSparse ? activeTiles.value().size(0) : C * tileExtentH * tileExtentW;
