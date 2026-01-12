@@ -22,37 +22,8 @@
 #include <cstdint>
 #include <optional>
 
-// #include <cupti.h>
-
 namespace fvdb::detail::ops {
 namespace {
-
-// // Callback for buffer requests
-// static void BufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
-//     *size = 8 * 1024 * 1024; // 8MB buffer
-//     *maxNumRecords = 0;
-//     *buffer = (uint8_t*)malloc(*size);
-// }
-//
-// // Callback for buffer completed
-// static void BufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer, size_t size,
-// size_t validSize) {
-//     CUpti_Activity *record = NULL;
-//
-//     if (validSize > 0)
-//     {
-//         // Parse CUPTI activity records here, print kernel name and duration
-//         while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS)
-//         {
-//             if (record->kind == CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER) {
-//                 CUpti_ActivityUnifiedMemoryCounter3 *counter =
-//                 (CUpti_ActivityUnifiedMemoryCounter3 *)record; printf("counter value = %zu\n",
-//                 counter->value);
-//             }
-//         }
-//     }
-//     free(buffer);
-// }
 
 // Structure to hold arguments and methods for the rasterize forward kernel
 template <typename ScalarType, uint32_t NUM_CHANNELS, bool IS_PACKED> struct RasterizeForwardArgs {
@@ -466,26 +437,6 @@ launchRasterizeForwardKernels(
     const std::optional<torch::Tensor> &tilePixelMask       = std::nullopt,
     const std::optional<torch::Tensor> &tilePixelCumsum     = std::nullopt,
     const std::optional<torch::Tensor> &pixelMap            = std::nullopt) {
-    // CUptiResult cuptiResult;
-    // CUpti_ActivityUnifiedMemoryCounterConfig config[1];
-
-    // // Configure Unified memory counters.
-    // config[0].scope = CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_SCOPE_PROCESS_SINGLE_DEVICE;
-    // config[0].kind = CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_GPU_PAGE_FAULT;
-    // config[0].deviceId = 0;
-    // config[0].enable = 1;
-
-    // cuptiResult = cuptiActivityConfigureUnifiedMemoryCounter(config, 1);
-    // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
-
-    // // Step 1: Register CUPTI callbacks
-    // cuptiResult = cuptiActivityRegisterCallbacks(BufferRequested, BufferCompleted);
-    // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
-
-    // // Step 2: Enable CUPTI Activity Collection
-    // cuptiResult = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
-    // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
-
     TORCH_CHECK_VALUE(tileOffsets.size(2) == (imageWidth + tileSize - 1) / tileSize,
                       "tileOffsets width must match the number of tiles in image size");
     TORCH_CHECK_VALUE(tileOffsets.size(1) == (imageHeight + tileSize - 1) / tileSize,
@@ -645,15 +596,6 @@ launchRasterizeForwardKernels(
     }
 
     mergeStreams();
-
-    // for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-    //     C10_CUDA_CHECK(cudaSetDevice(deviceId));
-    //     C10_CUDA_CHECK(cudaDeviceSynchronize());
-    // }
-    //
-    // // Step 3: Flushing and Disabling CUPTI Activity
-    // cuptiActivityFlushAll(1);
-    // cuptiActivityDisable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
 
     // In dense mode, we need to reshape the output tensors to the original image size
     // because they are packed into a single JaggedTensor so that the output code is the same
