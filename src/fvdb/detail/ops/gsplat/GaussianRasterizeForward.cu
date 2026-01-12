@@ -33,19 +33,21 @@ namespace {
 //     *maxNumRecords = 0;
 //     *buffer = (uint8_t*)malloc(*size);
 // }
-// 
+//
 // // Callback for buffer completed
-// static void BufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer, size_t size, size_t validSize) {
+// static void BufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer, size_t size,
+// size_t validSize) {
 //     CUpti_Activity *record = NULL;
-// 
+//
 //     if (validSize > 0)
 //     {
 //         // Parse CUPTI activity records here, print kernel name and duration
 //         while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS)
 //         {
 //             if (record->kind == CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER) {
-//                 CUpti_ActivityUnifiedMemoryCounter3 *counter = (CUpti_ActivityUnifiedMemoryCounter3 *)record;
-//                 printf("counter value = %zu\n", counter->value);
+//                 CUpti_ActivityUnifiedMemoryCounter3 *counter =
+//                 (CUpti_ActivityUnifiedMemoryCounter3 *)record; printf("counter value = %zu\n",
+//                 counter->value);
 //             }
 //         }
 //     }
@@ -318,29 +320,6 @@ getSharedMemRequirements(const size_t tileSize) {
     return tileSize * tileSize * sizeof(Gaussian2D<ScalarType>);
 }
 
-void memPrefetchAsync(const torch::Tensor& self)
-{
-    if (!self.is_privateuseone())
-        return;
-
-    size_t nbytes =
-        at::detail::computeStorageNbytes(self.sizes(), self.strides(), self.itemsize(), self.storage_offset());
-
-    for (const auto deviceId : c10::irange(c10::cuda::device_count()))
-    {
-        size_t device_offset, device_nbytes;
-        std::tie(device_offset, device_nbytes) = deviceChunk(nbytes, deviceId);
-        if (device_nbytes > 0)
-        {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
-            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-            C10_CUDA_CHECK(cudaMemPrefetchAsync(static_cast<const uint8_t*>(self.storage().data()) + device_offset,
-                                            device_nbytes, location, 0, stream));
-        }
-    }
-}
-
 template <typename ScalarType, uint32_t NUM_CHANNELS, bool IS_PACKED>
 std::tuple<fvdb::JaggedTensor, fvdb::JaggedTensor, fvdb::JaggedTensor>
 launchRasterizeForwardKernel(
@@ -487,7 +466,6 @@ launchRasterizeForwardKernels(
     const std::optional<torch::Tensor> &tilePixelMask       = std::nullopt,
     const std::optional<torch::Tensor> &tilePixelCumsum     = std::nullopt,
     const std::optional<torch::Tensor> &pixelMap            = std::nullopt) {
-
     // CUptiResult cuptiResult;
     // CUpti_ActivityUnifiedMemoryCounterConfig config[1];
 
@@ -507,7 +485,6 @@ launchRasterizeForwardKernels(
     // // Step 2: Enable CUPTI Activity Collection
     // cuptiResult = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
     // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
-
 
     TORCH_CHECK_VALUE(tileOffsets.size(2) == (imageWidth + tileSize - 1) / tileSize,
                       "tileOffsets width must match the number of tiles in image size");
@@ -623,15 +600,26 @@ launchRasterizeForwardKernels(
             // Wait until tile offsets and Gaussian IDs have been computed
             C10_CUDA_CHECK(cudaEventSynchronize(tileEvents[deviceId]));
             C10_CUDA_CHECK(cudaEventDestroy(tileEvents[deviceId]));
-            int32_t deviceTileGaussianIdOffset = tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset];
-            int32_t deviceTileGaussianIdCount = ((deviceTileOffset + deviceTileCount >= tileOffsets.numel()) ? tileGaussianIds.numel() : tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset + deviceTileCount]) - deviceTileGaussianIdOffset;
-            cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
-            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileOffsets.const_data_ptr<int32_t>() + deviceTileOffset, deviceTileCount * sizeof(int32_t), location, 0, stream));
-            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileGaussianIds.const_data_ptr<int32_t>() + deviceTileGaussianIdOffset, deviceTileGaussianIdCount * sizeof(int32_t), location, 0, stream));
-
-            memPrefetchAsync(outFeatures.jdata());
-            memPrefetchAsync(outAlphas.jdata());
-            memPrefetchAsync(outLastIds.jdata());
+            int32_t deviceTileGaussianIdOffset =
+                tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset];
+            int32_t deviceTileGaussianIdCount =
+                ((deviceTileOffset + deviceTileCount >= tileOffsets.numel())
+                     ? tileGaussianIds.numel()
+                     : tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset + deviceTileCount]) -
+                deviceTileGaussianIdOffset;
+            cudaMemLocation location = {cudaMemLocationTypeDevice, deviceId};
+            C10_CUDA_CHECK(
+                cudaMemPrefetchAsync(tileOffsets.const_data_ptr<int32_t>() + deviceTileOffset,
+                                     deviceTileCount * sizeof(int32_t),
+                                     location,
+                                     0,
+                                     stream));
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileGaussianIds.const_data_ptr<int32_t>() +
+                                                    deviceTileGaussianIdOffset,
+                                                deviceTileGaussianIdCount * sizeof(int32_t),
+                                                location,
+                                                0,
+                                                stream));
 
             // Thread blocks cooperatively cache a tile of Gaussians in shared memory
             const uint32_t sharedMem = getSharedMemRequirements<ScalarType>(tileSize);
@@ -662,7 +650,7 @@ launchRasterizeForwardKernels(
     //     C10_CUDA_CHECK(cudaSetDevice(deviceId));
     //     C10_CUDA_CHECK(cudaDeviceSynchronize());
     // }
-    // 
+    //
     // // Step 3: Flushing and Disabling CUPTI Activity
     // cuptiActivityFlushAll(1);
     // cuptiActivityDisable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
