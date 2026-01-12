@@ -22,8 +22,35 @@
 #include <cstdint>
 #include <optional>
 
+// #include <cupti.h>
+
 namespace fvdb::detail::ops {
 namespace {
+
+// // Callback for buffer requests
+// static void BufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumRecords) {
+//     *size = 8 * 1024 * 1024; // 8MB buffer
+//     *maxNumRecords = 0;
+//     *buffer = (uint8_t*)malloc(*size);
+// }
+// 
+// // Callback for buffer completed
+// static void BufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer, size_t size, size_t validSize) {
+//     CUpti_Activity *record = NULL;
+// 
+//     if (validSize > 0)
+//     {
+//         // Parse CUPTI activity records here, print kernel name and duration
+//         while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS)
+//         {
+//             if (record->kind == CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER) {
+//                 CUpti_ActivityUnifiedMemoryCounter3 *counter = (CUpti_ActivityUnifiedMemoryCounter3 *)record;
+//                 printf("counter value = %zu\n", counter->value);
+//             }
+//         }
+//     }
+//     free(buffer);
+// }
 
 // Structure to hold arguments and methods for the rasterize forward kernel
 template <typename ScalarType, uint32_t NUM_CHANNELS, bool IS_PACKED> struct RasterizeForwardArgs {
@@ -460,6 +487,28 @@ launchRasterizeForwardKernels(
     const std::optional<torch::Tensor> &tilePixelMask       = std::nullopt,
     const std::optional<torch::Tensor> &tilePixelCumsum     = std::nullopt,
     const std::optional<torch::Tensor> &pixelMap            = std::nullopt) {
+
+    // CUptiResult cuptiResult;
+    // CUpti_ActivityUnifiedMemoryCounterConfig config[1];
+
+    // // Configure Unified memory counters.
+    // config[0].scope = CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_SCOPE_PROCESS_SINGLE_DEVICE;
+    // config[0].kind = CUPTI_ACTIVITY_UNIFIED_MEMORY_COUNTER_KIND_GPU_PAGE_FAULT;
+    // config[0].deviceId = 0;
+    // config[0].enable = 1;
+
+    // cuptiResult = cuptiActivityConfigureUnifiedMemoryCounter(config, 1);
+    // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
+
+    // // Step 1: Register CUPTI callbacks
+    // cuptiResult = cuptiActivityRegisterCallbacks(BufferRequested, BufferCompleted);
+    // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
+
+    // // Step 2: Enable CUPTI Activity Collection
+    // cuptiResult = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
+    // TORCH_CHECK(cuptiResult == CUPTI_SUCCESS);
+
+
     TORCH_CHECK_VALUE(tileOffsets.size(2) == (imageWidth + tileSize - 1) / tileSize,
                       "tileOffsets width must match the number of tiles in image size");
     TORCH_CHECK_VALUE(tileOffsets.size(1) == (imageHeight + tileSize - 1) / tileSize,
@@ -473,6 +522,14 @@ launchRasterizeForwardKernels(
 
     const uint32_t tileExtentH = tileOffsets.size(1);
     const uint32_t tileExtentW = tileOffsets.size(2);
+
+    std::vector<cudaEvent_t> tileEvents(c10::cuda::device_count());
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        C10_CUDA_CHECK(cudaEventCreate(&tileEvents[deviceId], cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(tileEvents[deviceId], stream));
+    }
 
     TORCH_CHECK_VALUE(pixelMap.has_value() == pixelsToRender.has_value(),
                       "pixelMap and pixelsToRender must be provided together");
@@ -512,6 +569,8 @@ launchRasterizeForwardKernels(
             TORCH_CHECK(conics.is_contiguous());
             TORCH_CHECK(opacities.is_contiguous());
             TORCH_CHECK(features.is_contiguous());
+            TORCH_CHECK(tileOffsets.is_contiguous());
+            TORCH_CHECK(tileGaussianIds.is_contiguous());
 
             TORCH_CHECK(outFeatures.jdata().is_contiguous());
             TORCH_CHECK(outAlphas.jdata().is_contiguous());
@@ -521,8 +580,17 @@ launchRasterizeForwardKernels(
             memPrefetchAsync(conics);
             memPrefetchAsync(opacities);
             memPrefetchAsync(features);
-            memPrefetchAsync(tileOffsets);
-            memPrefetchAsync(tileGaussianIds);
+
+            // Wait until tile offsets and Gaussian IDs have been computed
+            C10_CUDA_CHECK(cudaEventSynchronize(tileEvents[deviceId]));
+            C10_CUDA_CHECK(cudaEventDestroy(tileEvents[deviceId]));
+            int32_t deviceTileGaussianIdOffset = tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset];
+            int32_t deviceTileGaussianIdCount = ((deviceTileOffset + deviceTileCount >= tileOffsets.numel()) ? tileGaussianIds.numel() : tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset + deviceTileCount]) - deviceTileGaussianIdOffset;
+            std::cout << "deviceId = " << (int)deviceId << ": (tileGaussianIdOffset, tileGaussianIdCount) = " << deviceTileGaussianIdOffset << ", " << deviceTileGaussianIdCount << ")" << std::endl; 
+            std::cout << "tileGaussianIds.sizes() = " << tileGaussianIds.sizes() << std::endl;
+            cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileOffsets.const_data_ptr<int32_t>() + deviceTileOffset, deviceTileCount * sizeof(int32_t), location, 0, stream));
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileGaussianIds.const_data_ptr<int32_t>() + deviceTileGaussianIdOffset, deviceTileGaussianIdCount * sizeof(int32_t), location, 0, stream));
 
             memPrefetchAsync(outFeatures.jdata());
             memPrefetchAsync(outAlphas.jdata());
@@ -574,6 +642,15 @@ launchRasterizeForwardKernels(
     }
 
     mergeStreams();
+
+    // for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+    //     C10_CUDA_CHECK(cudaSetDevice(deviceId));
+    //     C10_CUDA_CHECK(cudaDeviceSynchronize());
+    // }
+    // 
+    // // Step 3: Flushing and Disabling CUPTI Activity
+    // cuptiActivityFlushAll(1);
+    // cuptiActivityDisable(CUPTI_ACTIVITY_KIND_UNIFIED_MEMORY_COUNTER);
 
     // In dense mode, we need to reshape the output tensors to the original image size
     // because they are packed into a single JaggedTensor so that the output code is the same
@@ -655,27 +732,27 @@ dispatchGaussianRasterizeForward<torch::kCUDA>(
     // powers of two plus one to handle rendering common feature channel
     // dimensions with an optional additional depth channel
     switch (channels) {
-        CALL_FWD_CUDA(1)
-        CALL_FWD_CUDA(2)
+        // CALL_FWD_CUDA(1)
+        // CALL_FWD_CUDA(2)
         CALL_FWD_CUDA(3)
         CALL_FWD_CUDA(4)
-        CALL_FWD_CUDA(5)
-        CALL_FWD_CUDA(8)
-        CALL_FWD_CUDA(9)
-        CALL_FWD_CUDA(16)
-        CALL_FWD_CUDA(17)
-        CALL_FWD_CUDA(32)
-        CALL_FWD_CUDA(33)
-        CALL_FWD_CUDA(64)
-        CALL_FWD_CUDA(65)
-        CALL_FWD_CUDA(128)
-        CALL_FWD_CUDA(129)
-        CALL_FWD_CUDA(192)
-        CALL_FWD_CUDA(193)
-        CALL_FWD_CUDA(256)
-        CALL_FWD_CUDA(257)
-        CALL_FWD_CUDA(512)
-        CALL_FWD_CUDA(513)
+        // CALL_FWD_CUDA(5)
+        // CALL_FWD_CUDA(8)
+        // CALL_FWD_CUDA(9)
+        // CALL_FWD_CUDA(16)
+        // CALL_FWD_CUDA(17)
+        // CALL_FWD_CUDA(32)
+        // CALL_FWD_CUDA(33)
+        // CALL_FWD_CUDA(64)
+        // CALL_FWD_CUDA(65)
+        // CALL_FWD_CUDA(128)
+        // CALL_FWD_CUDA(129)
+        // CALL_FWD_CUDA(192)
+        // CALL_FWD_CUDA(193)
+        // CALL_FWD_CUDA(256)
+        // CALL_FWD_CUDA(257)
+        // CALL_FWD_CUDA(512)
+        // CALL_FWD_CUDA(513)
     default: AT_ERROR("Unsupported number of channels: ", channels);
     }
 }
@@ -747,27 +824,27 @@ dispatchGaussianRasterizeForward<torch::kPrivateUse1>(
     // powers of two plus one to handle rendering common feature channel
     // dimensions with an optional additional depth channel
     switch (channels) {
-        CALL_FWD_PRIVATEUSE1(1)
-        CALL_FWD_PRIVATEUSE1(2)
+        // CALL_FWD_PRIVATEUSE1(1)
+        // CALL_FWD_PRIVATEUSE1(2)
         CALL_FWD_PRIVATEUSE1(3)
         CALL_FWD_PRIVATEUSE1(4)
-        CALL_FWD_PRIVATEUSE1(5)
-        CALL_FWD_PRIVATEUSE1(8)
-        CALL_FWD_PRIVATEUSE1(9)
-        CALL_FWD_PRIVATEUSE1(16)
-        CALL_FWD_PRIVATEUSE1(17)
-        CALL_FWD_PRIVATEUSE1(32)
-        CALL_FWD_PRIVATEUSE1(33)
-        CALL_FWD_PRIVATEUSE1(64)
-        CALL_FWD_PRIVATEUSE1(65)
-        CALL_FWD_PRIVATEUSE1(128)
-        CALL_FWD_PRIVATEUSE1(129)
-        CALL_FWD_PRIVATEUSE1(192)
-        CALL_FWD_PRIVATEUSE1(193)
-        CALL_FWD_PRIVATEUSE1(256)
-        CALL_FWD_PRIVATEUSE1(257)
-        CALL_FWD_PRIVATEUSE1(512)
-        CALL_FWD_PRIVATEUSE1(513)
+        // CALL_FWD_PRIVATEUSE1(5)
+        // CALL_FWD_PRIVATEUSE1(8)
+        // CALL_FWD_PRIVATEUSE1(9)
+        // CALL_FWD_PRIVATEUSE1(16)
+        // CALL_FWD_PRIVATEUSE1(17)
+        // CALL_FWD_PRIVATEUSE1(32)
+        // CALL_FWD_PRIVATEUSE1(33)
+        // CALL_FWD_PRIVATEUSE1(64)
+        // CALL_FWD_PRIVATEUSE1(65)
+        // CALL_FWD_PRIVATEUSE1(128)
+        // CALL_FWD_PRIVATEUSE1(129)
+        // CALL_FWD_PRIVATEUSE1(192)
+        // CALL_FWD_PRIVATEUSE1(193)
+        // CALL_FWD_PRIVATEUSE1(256)
+        // CALL_FWD_PRIVATEUSE1(257)
+        // CALL_FWD_PRIVATEUSE1(512)
+        // CALL_FWD_PRIVATEUSE1(513)
     default: AT_ERROR("Unsupported number of channels: ", channels);
     }
 }
@@ -870,27 +947,27 @@ dispatchGaussianSparseRasterizeForward<torch::kCUDA>(
     // powers of two plus one to handle rendering common feature channel
     // dimensions with an optional additional depth channel
     switch (channels) {
-        CALL_FWD_SPARSE_CUDA(1)
-        CALL_FWD_SPARSE_CUDA(2)
+        // CALL_FWD_SPARSE_CUDA(1)
+        // CALL_FWD_SPARSE_CUDA(2)
         CALL_FWD_SPARSE_CUDA(3)
         CALL_FWD_SPARSE_CUDA(4)
-        CALL_FWD_SPARSE_CUDA(5)
-        CALL_FWD_SPARSE_CUDA(8)
-        CALL_FWD_SPARSE_CUDA(9)
-        CALL_FWD_SPARSE_CUDA(16)
-        CALL_FWD_SPARSE_CUDA(17)
-        CALL_FWD_SPARSE_CUDA(32)
-        CALL_FWD_SPARSE_CUDA(33)
-        CALL_FWD_SPARSE_CUDA(64)
-        CALL_FWD_SPARSE_CUDA(65)
-        CALL_FWD_SPARSE_CUDA(128)
-        CALL_FWD_SPARSE_CUDA(129)
-        CALL_FWD_SPARSE_CUDA(192)
-        CALL_FWD_SPARSE_CUDA(193)
-        CALL_FWD_SPARSE_CUDA(256)
-        CALL_FWD_SPARSE_CUDA(257)
-        CALL_FWD_SPARSE_CUDA(512)
-        CALL_FWD_SPARSE_CUDA(513)
+        // CALL_FWD_SPARSE_CUDA(5)
+        // CALL_FWD_SPARSE_CUDA(8)
+        // CALL_FWD_SPARSE_CUDA(9)
+        // CALL_FWD_SPARSE_CUDA(16)
+        // CALL_FWD_SPARSE_CUDA(17)
+        // CALL_FWD_SPARSE_CUDA(32)
+        // CALL_FWD_SPARSE_CUDA(33)
+        // CALL_FWD_SPARSE_CUDA(64)
+        // CALL_FWD_SPARSE_CUDA(65)
+        // CALL_FWD_SPARSE_CUDA(128)
+        // CALL_FWD_SPARSE_CUDA(129)
+        // CALL_FWD_SPARSE_CUDA(192)
+        // CALL_FWD_SPARSE_CUDA(193)
+        // CALL_FWD_SPARSE_CUDA(256)
+        // CALL_FWD_SPARSE_CUDA(257)
+        // CALL_FWD_SPARSE_CUDA(512)
+        // CALL_FWD_SPARSE_CUDA(513)
     default: AT_ERROR("Unsupported number of channels: ", channels);
     }
 }
