@@ -586,8 +586,8 @@ launchRasterizeForwardKernels(
             C10_CUDA_CHECK(cudaEventDestroy(tileEvents[deviceId]));
             int32_t deviceTileGaussianIdOffset = tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset];
             int32_t deviceTileGaussianIdCount = ((deviceTileOffset + deviceTileCount >= tileOffsets.numel()) ? tileGaussianIds.numel() : tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset + deviceTileCount]) - deviceTileGaussianIdOffset;
-            std::cout << "deviceId = " << (int)deviceId << ": (tileGaussianIdOffset, tileGaussianIdCount) = " << deviceTileGaussianIdOffset << ", " << deviceTileGaussianIdCount << ")" << std::endl; 
-            std::cout << "tileGaussianIds.sizes() = " << tileGaussianIds.sizes() << std::endl;
+            // std::cout << "deviceId = " << (int)deviceId << ": (tileGaussianIdOffset, tileGaussianIdCount) = " << deviceTileGaussianIdOffset << ", " << deviceTileGaussianIdCount << ")" << std::endl; 
+            // std::cout << "tileGaussianIds.sizes() = " << tileGaussianIds.sizes() << std::endl;
             cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
             C10_CUDA_CHECK(cudaMemPrefetchAsync(tileOffsets.const_data_ptr<int32_t>() + deviceTileOffset, deviceTileCount * sizeof(int32_t), location, 0, stream));
             C10_CUDA_CHECK(cudaMemPrefetchAsync(tileGaussianIds.const_data_ptr<int32_t>() + deviceTileGaussianIdOffset, deviceTileGaussianIdCount * sizeof(int32_t), location, 0, stream));
