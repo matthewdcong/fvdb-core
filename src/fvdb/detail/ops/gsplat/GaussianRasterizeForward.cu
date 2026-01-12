@@ -576,26 +576,6 @@ launchRasterizeForwardKernels(
             TORCH_CHECK(outAlphas.jdata().is_contiguous());
             TORCH_CHECK(outLastIds.jdata().is_contiguous());
 
-            memPrefetchAsync(means2d);
-            memPrefetchAsync(conics);
-            memPrefetchAsync(opacities);
-            memPrefetchAsync(features);
-
-            // Wait until tile offsets and Gaussian IDs have been computed
-            C10_CUDA_CHECK(cudaEventSynchronize(tileEvents[deviceId]));
-            C10_CUDA_CHECK(cudaEventDestroy(tileEvents[deviceId]));
-            int32_t deviceTileGaussianIdOffset = tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset];
-            int32_t deviceTileGaussianIdCount = ((deviceTileOffset + deviceTileCount >= tileOffsets.numel()) ? tileGaussianIds.numel() : tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset + deviceTileCount]) - deviceTileGaussianIdOffset;
-            // std::cout << "deviceId = " << (int)deviceId << ": (tileGaussianIdOffset, tileGaussianIdCount) = " << deviceTileGaussianIdOffset << ", " << deviceTileGaussianIdCount << ")" << std::endl; 
-            // std::cout << "tileGaussianIds.sizes() = " << tileGaussianIds.sizes() << std::endl;
-            cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
-            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileOffsets.const_data_ptr<int32_t>() + deviceTileOffset, deviceTileCount * sizeof(int32_t), location, 0, stream));
-            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileGaussianIds.const_data_ptr<int32_t>() + deviceTileGaussianIdOffset, deviceTileGaussianIdCount * sizeof(int32_t), location, 0, stream));
-
-            memPrefetchAsync(outFeatures.jdata());
-            memPrefetchAsync(outAlphas.jdata());
-            memPrefetchAsync(outLastIds.jdata());
-
             auto args = RasterizeForwardArgs<ScalarType, NUM_CHANNELS, IS_PACKED>(means2d,
                                                                                   conics,
                                                                                   opacities,
@@ -617,6 +597,41 @@ launchRasterizeForwardKernels(
                                                                                   tilePixelMask,
                                                                                   tilePixelCumsum,
                                                                                   pixelMap);
+
+            TORCH_CHECK(means2d.is_contiguous());
+            TORCH_CHECK(conics.is_contiguous());
+            TORCH_CHECK(opacities.is_contiguous());
+            TORCH_CHECK(features.is_contiguous());
+
+            nanovdb::util::cuda::memPrefetchAsync(means2d.const_data_ptr<ScalarType>(),
+                                                  means2d.numel() * sizeof(ScalarType),
+                                                  deviceId,
+                                                  stream);
+            nanovdb::util::cuda::memPrefetchAsync(conics.const_data_ptr<ScalarType>(),
+                                                  conics.numel() * sizeof(ScalarType),
+                                                  deviceId,
+                                                  stream);
+            nanovdb::util::cuda::memPrefetchAsync(opacities.const_data_ptr<ScalarType>(),
+                                                  opacities.numel() * sizeof(ScalarType),
+                                                  deviceId,
+                                                  stream);
+            nanovdb::util::cuda::memPrefetchAsync(features.const_data_ptr<ScalarType>(),
+                                                  features.numel() * sizeof(ScalarType),
+                                                  deviceId,
+                                                  stream);
+
+            // Wait until tile offsets and Gaussian IDs have been computed
+            C10_CUDA_CHECK(cudaEventSynchronize(tileEvents[deviceId]));
+            C10_CUDA_CHECK(cudaEventDestroy(tileEvents[deviceId]));
+            int32_t deviceTileGaussianIdOffset = tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset];
+            int32_t deviceTileGaussianIdCount = ((deviceTileOffset + deviceTileCount >= tileOffsets.numel()) ? tileGaussianIds.numel() : tileOffsets.const_data_ptr<int32_t>()[deviceTileOffset + deviceTileCount]) - deviceTileGaussianIdOffset;
+            cudaMemLocation location = { cudaMemLocationTypeDevice, deviceId };
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileOffsets.const_data_ptr<int32_t>() + deviceTileOffset, deviceTileCount * sizeof(int32_t), location, 0, stream));
+            C10_CUDA_CHECK(cudaMemPrefetchAsync(tileGaussianIds.const_data_ptr<int32_t>() + deviceTileGaussianIdOffset, deviceTileGaussianIdCount * sizeof(int32_t), location, 0, stream));
+
+            memPrefetchAsync(outFeatures.jdata());
+            memPrefetchAsync(outAlphas.jdata());
+            memPrefetchAsync(outLastIds.jdata());
 
             // Thread blocks cooperatively cache a tile of Gaussians in shared memory
             const uint32_t sharedMem = getSharedMemRequirements<ScalarType>(tileSize);
