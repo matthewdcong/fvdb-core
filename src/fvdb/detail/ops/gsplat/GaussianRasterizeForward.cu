@@ -481,9 +481,12 @@ launchRasterizeForwardKernels(
 
     auto isSparse      = activeTiles.has_value();
     uint32_t tileCount = isSparse ? activeTiles.value().size(0) : C * tileExtentH * tileExtentW;
+
+    std::vector<cudaEvent_t> events(c10::cuda::device_count());
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        C10_CUDA_CHECK(cudaEventCreate(&events[deviceId], cudaEventDisableTiming));
 
         uint32_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
@@ -515,6 +518,10 @@ launchRasterizeForwardKernels(
             TORCH_CHECK(conics.is_contiguous());
             TORCH_CHECK(opacities.is_contiguous());
             TORCH_CHECK(features.is_contiguous());
+
+            if (deviceId > 0) {
+                cudaStreamWaitEvent(stream, events[deviceId - 1]);
+            }
 
             nanovdb::util::cuda::memPrefetchAsync(means2d.const_data_ptr<ScalarType>(),
                                                   means2d.numel() * sizeof(ScalarType),
@@ -554,9 +561,19 @@ launchRasterizeForwardKernels(
 
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
+
+        C10_CUDA_CHECK(cudaEventRecord(events[deviceId], stream));
     }
 
-    mergeStreams();
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, events[c10::cuda::device_count() - 1]));
+    }
+
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaEventDestroy(events[deviceId]));
+    }
 
     // In dense mode, we need to reshape the output tensors to the original image size
     // because they are packed into a single JaggedTensor so that the output code is the same
