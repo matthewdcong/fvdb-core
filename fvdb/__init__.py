@@ -239,11 +239,31 @@ def gaussian_render_jagged(
         render_quantities = torch.cat([render_quantities, depths[gaussian_ids].unsqueeze(-1)], dim=-1)
 
     # --- Non-differentiable tile intersection ---
+    # Jagged render is packed by construction: means2d / radii / depths /
+    # conics are flat [nnz, ...] arrays with a per-element camera_ids; gsplat
+    # accepts that via the (image_ids, gaussian_ids) tuple.
     num_tiles_h = math.ceil(image_height / tile_size)
     num_tiles_w = math.ceil(image_width / tile_size)
-    tile_offsets, tile_gaussian_ids_t = _C.intersect_gaussian_tiles(
-        means2d, radii, depths, ccz, tile_size, num_tiles_h, num_tiles_w, camera_ids
+    # gsplat's intersect_tile expects int64 image_ids / gaussian_ids in packed
+    # mode; fvdb's camera_ids upstream is int32, so widen here.
+    nnz = means2d.shape[0]
+    isect_gaussian_ids = torch.arange(nnz, device=means2d.device, dtype=torch.int64)
+    _tiles_per_gauss, isect_ids, tile_gaussian_ids_t = torch.ops.gsplat.intersect_tile(
+        means2d,
+        radii,
+        depths,
+        None,  # conics — stay on the AABB path (fvdb has no AccuTile counterpart)
+        None,  # opacities
+        camera_ids.to(torch.int64),
+        isect_gaussian_ids,
+        ccz,
+        tile_size,
+        num_tiles_w,
+        num_tiles_h,
+        True,  # sort by (cam, tile, depth)
+        False,  # segmented sort off
     )
+    tile_offsets = torch.ops.gsplat.intersect_offset(isect_ids, ccz, num_tiles_w, num_tiles_h)
     if return_debug_info:
         debug_info["tile_offsets"] = tile_offsets
         debug_info["tile_gaussian_ids"] = tile_gaussian_ids_t

@@ -1658,15 +1658,22 @@ class GaussianSplat3d:
         """
         num_tiles_h = math.ceil(H / tile_size)
         num_tiles_w = math.ceil(W / tile_size)
-        tile_offsets, tile_gaussian_ids = _C.intersect_gaussian_tiles(
+        _tiles_per_gauss, isect_ids, tile_gaussian_ids = torch.ops.gsplat.intersect_tile(
             means2d,
             radii,
             depths,
+            None,  # conics — stay on the AABB path (fvdb has no AccuTile counterpart)
+            None,  # opacities
+            None,  # image_ids — unpacked only
+            None,  # gaussian_ids — unpacked only
             C,
             tile_size,
-            num_tiles_h,
             num_tiles_w,
+            num_tiles_h,
+            True,  # sort by (cam, tile, depth)
+            False,  # segmented sort off
         )
+        tile_offsets = torch.ops.gsplat.intersect_offset(isect_ids, C, num_tiles_w, num_tiles_h)
         return tile_offsets, tile_gaussian_ids, num_tiles_h, num_tiles_w
 
     def _intersect_tiles_sparse(
@@ -2475,15 +2482,22 @@ class GaussianSplat3d:
         if is_crop:
             num_tiles_h = math.ceil(raster_h / tile_size)
             num_tiles_w = math.ceil(raster_w / tile_size)
-            tile_offsets, tile_gaussian_ids = _C.intersect_gaussian_tiles(
+            _tiles_per_gauss, isect_ids, tile_gaussian_ids = torch.ops.gsplat.intersect_tile(
                 pg.means2d,
                 pg.radii,
                 pg.depths,
+                None,  # conics — stay on the AABB path (fvdb has no AccuTile counterpart)
+                None,  # opacities
+                None,  # image_ids — unpacked only
+                None,  # gaussian_ids — unpacked only
                 C,
                 tile_size,
-                num_tiles_h,
                 num_tiles_w,
+                num_tiles_h,
+                True,  # sort by (cam, tile, depth)
+                False,  # segmented sort off
             )
+            tile_offsets = torch.ops.gsplat.intersect_offset(isect_ids, C, num_tiles_w, num_tiles_h)
             features, alphas = cast(
                 tuple[torch.Tensor, torch.Tensor],
                 _RasterizeScreenSpaceGaussiansFn.apply(
