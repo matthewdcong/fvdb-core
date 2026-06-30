@@ -275,28 +275,17 @@ def gaussian_render_jagged(
         tile_size,
         tile_offsets,
         tile_gaussian_ids_t,
-        backgrounds=None,
+        backgrounds=backgrounds,
         masks=masks,
         packed=True,
         absgrad=False,
     )
-    rendered_images, rendered_alphas = _apply_tile_mask(
-        rendered_images,
-        rendered_alphas,
-        masks,
-        tile_size,
-        image_width,
-        image_height,
-        None,
-    )
-    if backgrounds is not None:
-        rendered_images = rendered_images + (1.0 - rendered_alphas) * backgrounds[:, None, None, :]
 
     return rendered_images, rendered_alphas, debug_info
 
 
 from .convolution_plan import ConvolutionPlan
-from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats, _apply_tile_mask, _evaluate_gaussian_sh
+from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats, _evaluate_gaussian_sh
 from .enums import CameraModel, ProjectionMethod, RollingShutterType, ShOrderingMode, SmoothingMode
 
 

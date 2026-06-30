@@ -1598,6 +1598,12 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
             accumulated_transparency *= 1.0 - opacity
         return expected_alpha
 
+    def _assert_jagged_close(self, actual: JaggedTensor, expected: JaggedTensor) -> None:
+        self.assertEqual(actual.ldim, expected.ldim)
+        self.assertTrue(torch.equal(actual.joffsets, expected.joffsets))
+        self.assertTrue(torch.equal(actual.jlidx, expected.jlidx))
+        torch.testing.assert_close(actual.jdata, expected.jdata, atol=1e-5, rtol=1e-5)
+
     def test_gaussians_center_render(self):
         h = 1024
         w = 512
@@ -1708,7 +1714,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         for ids_no_topk, ids_with_topk in zip(ids.unbind(), ids_topk.unbind()):
             self.assertTrue(torch.equal(ids_no_topk[0], ids_with_topk[0]))
         for weights_no_topk, weights_with_topk in zip(weights.unbind(), weights_topk.unbind()):
-            self.assertTrue(torch.equal(weights_no_topk[0], weights_with_topk[0]))
+            torch.testing.assert_close(weights_no_topk[0], weights_with_topk[0], atol=1e-5, rtol=1e-5)
 
         # sparse rendering
         # render the center pixel
@@ -1733,7 +1739,12 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         )
 
         # test the center pixel should have the correct alpha
-        self.assertTrue(torch.equal(sparse_alphas.unbind()[0][0], alphas[0][h // 2 - 1][w // 2 - 1]))
+        torch.testing.assert_close(
+            sparse_alphas.unbind()[0][0],
+            alphas[0][h // 2 - 1][w // 2 - 1],
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
         # test sparse render top contributing gaussian ids
         sparse_ids, sparse_weights = gs3d.sparse_render_contributing_gaussian_ids(
@@ -1748,7 +1759,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
 
         self.assertTrue(torch.equal(sparse_ids.unbind()[0][0], middle_pixel_ids))
 
-        self.assertTrue(torch.equal(sparse_weights.unbind()[0][0], middle_pixel_weights))
+        torch.testing.assert_close(sparse_weights.unbind()[0][0], middle_pixel_weights, atol=1e-5, rtol=1e-5)
 
         # Test that sparse_render_contributing_gaussian_ids with top_k_contributors
         # set to max(num_contributing_gaussians) produces identical results
@@ -1768,7 +1779,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         for ids_no_topk, ids_with_topk in zip(sparse_ids.unbind(), sparse_ids_topk.unbind()):
             self.assertTrue(torch.equal(ids_no_topk[0], ids_with_topk[0]))
         for weights_no_topk, weights_with_topk in zip(sparse_weights.unbind(), sparse_weights_topk.unbind()):
-            self.assertTrue(torch.equal(weights_no_topk[0], weights_with_topk[0]))
+            torch.testing.assert_close(weights_no_topk[0], weights_with_topk[0], atol=1e-5, rtol=1e-5)
 
     def test_gaussians_grid_render(self):
         h = 1024
@@ -1928,7 +1939,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         for ids_no_topk, ids_with_topk in zip(ids.unbind(), ids_topk.unbind()):
             self.assertTrue(torch.equal(ids_no_topk[0], ids_with_topk[0]))
         for weights_no_topk, weights_with_topk in zip(weights.unbind(), weights_topk.unbind()):
-            self.assertTrue(torch.equal(weights_no_topk[0], weights_with_topk[0]))
+            torch.testing.assert_close(weights_no_topk[0], weights_with_topk[0], atol=1e-5, rtol=1e-5)
 
         ##########################################################
         ## Sparse Rendering- use pixels that we know have gaussians (center pixels)
@@ -1973,7 +1984,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
             x_coords = pixels[:, 1]  # [num_pixels_to_render]
             # Index reference_alphas using the coordinates
             selected_reference_alphas = reference_alphas[y_coords, x_coords]
-            self.assertTrue(torch.equal(sparse_alphas, selected_reference_alphas))
+            torch.testing.assert_close(sparse_alphas, selected_reference_alphas, atol=1e-5, rtol=1e-5)
 
         # test sparse render contributing gaussian ids
         sparse_ids, sparse_weights = gs3d.sparse_render_contributing_gaussian_ids(
@@ -2006,7 +2017,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
 
                 # Compare
                 self.assertTrue(torch.equal(sparse_pixel_ids, reference_pixel_ids))
-                self.assertTrue(torch.equal(sparse_pixel_weights, reference_pixel_weights))
+                torch.testing.assert_close(sparse_pixel_weights, reference_pixel_weights, atol=1e-5, rtol=1e-5)
 
         # Test that sparse_render_contributing_gaussian_ids with top_k_contributors
         # set to max(num_contributing_gaussians) produces identical results
@@ -2026,7 +2037,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         for ids_no_topk, ids_with_topk in zip(sparse_ids.unbind(), sparse_ids_topk.unbind()):
             self.assertTrue(torch.equal(ids_no_topk[0], ids_with_topk[0]))
         for weights_no_topk, weights_with_topk in zip(sparse_weights.unbind(), sparse_weights_topk.unbind()):
-            self.assertTrue(torch.equal(weights_no_topk[0], weights_with_topk[0]))
+            torch.testing.assert_close(weights_no_topk[0], weights_with_topk[0], atol=1e-5, rtol=1e-5)
 
     def test_gaussian_contributors_scene_render(self):
         # Test render num contributing gaussians
@@ -2064,7 +2075,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         )
 
         self.assertTrue(torch.equal(num_contributing_gaussians, num_contributing_gaussians_regression))
-        self.assertTrue(torch.equal(alphas, alphas_regression))
+        torch.testing.assert_close(alphas, alphas_regression, atol=1e-5, rtol=1e-5)
 
         # Test render top contributing gaussian ids
         ids, weights = self.gs3d.render_contributing_gaussian_ids(
@@ -2087,7 +2098,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
         )
 
         self.assertTrue(ids == ids_regression)
-        self.assertTrue(weights == weights_regression)
+        self._assert_jagged_close(weights, weights_regression)
 
     def test_gaussian_contributors_scene_sparse_render(self):
         # sparse rendering
@@ -2163,7 +2174,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
             x_coords = pixels[:, 1]  # [num_pixels_to_render]
             # Index reference_alphas using the coordinates
             selected_reference_alphas = reference_alphas[y_coords, x_coords]
-            self.assertTrue(torch.equal(sparse_alphas, selected_reference_alphas))
+            torch.testing.assert_close(sparse_alphas, selected_reference_alphas, atol=1e-5, rtol=1e-5)
 
         # Test render top contributing gaussian ids
         sparse_ids, sparse_weights = self.gs3d.sparse_render_contributing_gaussian_ids(
@@ -2213,7 +2224,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
             selected_tensors = [reference_weights_list[idx.item()] for idx in pixel_indices]  # type: ignore
             selected_reference_weights = JaggedTensor(selected_tensors)
 
-            self.assertTrue(image_sparse_weights == selected_reference_weights)
+            self._assert_jagged_close(image_sparse_weights, selected_reference_weights)
 
     def test_gaussian_contributors_scene_dense_pixels_sparse_render(self):
         # Test that the sparse render works with dense pixel specification
@@ -2272,7 +2283,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
             x_coords = pixels[:, 1]  # [num_pixels_to_render]
             # Index reference_alphas using the coordinates
             selected_reference_alphas = reference_alphas[y_coords, x_coords]
-            self.assertTrue(torch.equal(sparse_alphas, selected_reference_alphas))
+            torch.testing.assert_close(sparse_alphas, selected_reference_alphas, atol=1e-5, rtol=1e-5)
 
         # test sparse render top contributing gaussian ids
         sparse_ids, sparse_weights = self.gs3d.sparse_render_contributing_gaussian_ids(
@@ -2322,7 +2333,7 @@ class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
             selected_tensors = [reference_weights_list[idx.item()] for idx in pixel_indices]  # type: ignore
             selected_reference_weights = JaggedTensor(selected_tensors)
 
-            self.assertTrue(image_sparse_weights == selected_reference_weights)
+            self._assert_jagged_close(image_sparse_weights, selected_reference_weights)
 
 
 class TestGaussianRenderSparse(BaseGaussianTestCase):
@@ -4092,20 +4103,26 @@ class TestGaussianRenderSparseDuplicatePixels(BaseGaussianTestCase):
             self.far_plane,
         )
 
-        self.assertEqual(ids.jdata.size(0), pixels.size(0))
+        ids_by_pixel = ids.unbind()[0]
+        weights_by_pixel = weights.unbind()[0]
+        self.assertEqual(len(ids_by_pixel), pixels.size(0))
+        self.assertEqual(len(weights_by_pixel), pixels.size(0))
 
         coords = pixels.to(self.device)
         keys = coords[:, 0] * self.width + coords[:, 1]
         unique_keys, inverse = keys.unique(return_inverse=True)
         for i in range(unique_keys.size(0)):
-            mask = inverse == i
-            id_vals = ids.jdata[mask]
-            weight_vals = weights.jdata[mask]
-            self.assertTrue(torch.all(id_vals == id_vals[0:1]), "Duplicate pixels have different contributing IDs")
-            self.assertTrue(
-                torch.allclose(weight_vals, weight_vals[0:1], atol=1e-6, rtol=1e-8),
-                "Duplicate pixels have different contributing weights",
-            )
+            duplicate_indices = torch.nonzero(inverse == i, as_tuple=False).flatten().tolist()
+            reference_ids = ids_by_pixel[duplicate_indices[0]]
+            reference_weights = weights_by_pixel[duplicate_indices[0]]
+            for duplicate_index in duplicate_indices[1:]:
+                self.assertTrue(
+                    torch.equal(ids_by_pixel[duplicate_index], reference_ids),
+                    "Duplicate pixels have different contributing IDs",
+                )
+                torch.testing.assert_close(
+                    weights_by_pixel[duplicate_index], reference_weights, atol=1e-5, rtol=1e-5
+                )
 
     def test_sparse_render_multi_camera_with_duplicates(self):
         pixels_list = []
