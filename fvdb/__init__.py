@@ -64,6 +64,7 @@ from ._fvdb_cpp import (
 from ._volume_render import volume_render
 from . import _fvdb_cpp as _C
 
+import gsplat
 import math
 
 # Import JaggedTensor from jagged_tensor.py
@@ -72,12 +73,7 @@ from .grid import Grid
 from .grid_batch import GridBatch, gcat
 from .grid import Grid
 from .attention import scaled_dot_product_attention
-
-from ._gaussian_autograd import (
-    _ProjectGaussiansJaggedFn,
-    _EvaluateGaussianSHFn,
-    _RasterizeScreenSpaceGaussiansFn,
-)
+from ._gaussian_autograd import _ProjectGaussiansJaggedFn
 
 
 # TODO: Make a batched class to encapsulate this jagged rendering pipeline.
@@ -107,8 +103,7 @@ def gaussian_render_jagged(
     """Render Gaussian splats with jagged (variable-length) batched inputs.
 
     This function composes differentiable projection, SH evaluation, tile intersection,
-    and rasterization stages, each backed by Python ``torch.autograd.Function`` wrappers
-    around the underlying CUDA/CPU dispatch kernels.
+    and rasterization stages.
 
     Args:
         means: Jagged tensor of Gaussian centers ``[sum(N_i), 3]``.
@@ -130,8 +125,8 @@ def gaussian_render_jagged(
         render_depth_channel: If ``True``, append a depth channel to the rendered colors.
         return_debug_info: If ``True``, return intermediate tensors in the debug dict.
         ortho: Use orthographic projection.
-        backgrounds: Optional per-camera background colors ``[total_cameras, D, H, W]``.
-        masks: Optional per-camera masks ``[total_cameras, 1, H, W]``.
+        backgrounds: Optional per-camera background colors ``[total_cameras, D]``.
+        masks: Optional per-camera tile masks ``[total_cameras, tile_height, tile_width]``.
 
     Returns:
         A tuple ``(rendered_images, rendered_alphas, debug_info)`` where
@@ -207,7 +202,7 @@ def gaussian_render_jagged(
 
     if actual_sh_degree == 0:
         sh0 = sh_coeffs_batched[0, :, :].unsqueeze(0)  # [1, nnz, D]
-        render_quantities = _EvaluateGaussianSHFn.apply(
+        render_quantities = _evaluate_gaussian_sh(
             actual_sh_degree,
             1,
             None,
@@ -225,7 +220,7 @@ def gaussian_render_jagged(
         # NOTE: dirs are not normalized here; the SH evaluation kernel normalizes
         # them internally.
         dirs = means.jdata[gaussian_ids] - camtoworlds[camera_ids, :3, 3]
-        render_quantities = _EvaluateGaussianSHFn.apply(
+        render_quantities = _evaluate_gaussian_sh(
             actual_sh_degree,
             1,
             dirs.unsqueeze(0),  # [1, nnz, 3]
@@ -244,55 +239,65 @@ def gaussian_render_jagged(
     # accepts that via the (image_ids, gaussian_ids) tuple.
     num_tiles_h = math.ceil(image_height / tile_size)
     num_tiles_w = math.ceil(image_width / tile_size)
-    # gsplat's intersect_tile expects int64 image_ids / gaussian_ids in packed
+    # gsplat's isect_tiles expects int64 image_ids / gaussian_ids in packed
     # mode; fvdb's camera_ids upstream is int32, so widen here.
     nnz = means2d.shape[0]
     isect_gaussian_ids = torch.arange(nnz, device=means2d.device, dtype=torch.int64)
-    _tiles_per_gauss, isect_ids, tile_gaussian_ids_t = torch.ops.gsplat.intersect_tile(
+    _tiles_per_gauss, isect_ids, tile_gaussian_ids_t = gsplat.isect_tiles(
         means2d,
         radii,
         depths,
-        None,  # conics — stay on the AABB path (fvdb has no AccuTile counterpart)
-        None,  # opacities
-        camera_ids.to(torch.int64),
-        isect_gaussian_ids,
-        ccz,
         tile_size,
         num_tiles_w,
         num_tiles_h,
-        True,  # sort by (cam, tile, depth)
-        False,  # segmented sort off
+        sort=True,
+        segmented=False,
+        packed=True,
+        n_images=ccz,
+        image_ids=camera_ids.to(torch.int64),
+        gaussian_ids=isect_gaussian_ids,
+        conics=None,  # stay on the AABB path (fvdb has no AccuTile counterpart)
+        opacities=None,
     )
-    tile_offsets = torch.ops.gsplat.intersect_offset(isect_ids, ccz, num_tiles_w, num_tiles_h)
+    tile_offsets = gsplat.isect_offset_encode(isect_ids, ccz, num_tiles_w, num_tiles_h)
     if return_debug_info:
         debug_info["tile_offsets"] = tile_offsets
         debug_info["tile_gaussian_ids"] = tile_gaussian_ids_t
 
     # --- Differentiable rasterization ---
-    rendered_images, rendered_alphas = _RasterizeScreenSpaceGaussiansFn.apply(
+    rendered_images, rendered_alphas = gsplat.rasterize_to_pixels(
         means2d,
         conics,
         render_quantities,
         opacities_batched.contiguous(),
         image_width,
         image_height,
-        0,  # image_origin_w
-        0,  # image_origin_h
         tile_size,
         tile_offsets,
         tile_gaussian_ids_t,
-        False,  # absgrad
-        backgrounds,
-        masks,
+        backgrounds=None,
+        masks=masks,
+        packed=True,
+        absgrad=False,
     )
+    rendered_images, rendered_alphas = _apply_tile_mask(
+        rendered_images,
+        rendered_alphas,
+        masks,
+        tile_size,
+        image_width,
+        image_height,
+        None,
+    )
+    if backgrounds is not None:
+        rendered_images = rendered_images + (1.0 - rendered_alphas) * backgrounds[:, None, None, :]
 
     return rendered_images, rendered_alphas, debug_info
 
 
 from .convolution_plan import ConvolutionPlan
-from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats
+from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats, _apply_tile_mask, _evaluate_gaussian_sh
 from .enums import CameraModel, ProjectionMethod, RollingShutterType, ShOrderingMode, SmoothingMode
-from ._gaussian_autograd import _EvaluateGaussianSHFn
 
 
 def evaluate_spherical_harmonics(
@@ -334,7 +339,7 @@ def evaluate_spherical_harmonics(
     if shN is None:
         N, _, D = sh0.shape
         shN = sh0.new_empty(N, 0, D)
-    return _EvaluateGaussianSHFn.apply(sh_degree, num_cameras, view_directions, sh0, shN, radii)
+    return _evaluate_gaussian_sh(sh_degree, num_cameras, view_directions, sh0, shN, radii)
 
 
 # Import torch-compatible functions that work with both Tensor and JaggedTensor

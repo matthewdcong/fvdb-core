@@ -3,27 +3,23 @@
 #
 import math
 import pathlib
-from typing import Any, Mapping, Sequence, TypeVar, cast, overload
+from typing import Any, Mapping, Sequence, TypeVar, overload
 
+import gsplat
 import torch
 import torch.nn.functional as F
 from fvdb.enums import CameraModel, ProjectionMethod
 
 from . import _fvdb_cpp as _C
 from ._fvdb_cpp import JaggedTensor as JaggedTensorCpp
-from ._gaussian_autograd import (
-    _EvaluateGaussianSHFn,
-    _ProjectGaussiansFn,
-    _RasterizeScreenSpaceGaussiansFn,
-    _RasterizeScreenSpaceGaussiansSparseFn,
-    _RasterizeWorldSpaceGaussiansFn,
-)
 from .grid import Grid
 from .grid_batch import GridBatch
 from .jagged_tensor import JaggedTensor
 from .types import DeviceIdentifier, cast_check, resolve_device
 
 JaggedTensorOrTensorT = TypeVar("JaggedTensorOrTensorT", JaggedTensor, torch.Tensor)
+
+_FVDB_SH_BIAS = 0.5
 
 
 def _pixel_mask_to_tile_mask(pixel_mask: torch.Tensor, tile_size: int) -> torch.Tensor:
@@ -65,6 +61,96 @@ def _apply_pixel_mask(
     features = features * mask_float + bg * (1.0 - mask_float)
     alphas = alphas * mask_float
     return features, alphas
+
+
+def _apply_tile_mask(
+    features: torch.Tensor,
+    alphas: torch.Tensor,
+    tile_mask: torch.Tensor | None,
+    tile_size: int,
+    image_width: int,
+    image_height: int,
+    backgrounds: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tile_mask is None:
+        return features, alphas
+    pixel_mask = (
+        tile_mask[:, :, None, :, None]
+        .expand(tile_mask.shape[0], tile_mask.shape[1], tile_size, tile_mask.shape[2], tile_size)
+        .reshape(tile_mask.shape[0], tile_mask.shape[1] * tile_size, tile_mask.shape[2] * tile_size)[
+            :, :image_height, :image_width
+        ]
+    )
+    return _apply_pixel_mask(features, alphas, pixel_mask, backgrounds)
+
+
+def _gsplat_camera_model(camera_model: CameraModel) -> str:
+    return "ortho" if camera_model == CameraModel.ORTHOGRAPHIC else "pinhole"
+
+
+def _make_orthographic_rays(
+    world_to_camera_matrices: torch.Tensor,
+    projection_matrices: torch.Tensor,
+    image_width: int,
+    image_height: int,
+) -> torch.Tensor:
+    """Build world-space orthographic rays in gsplat's ``[C, H, W, 6]`` layout."""
+    C = world_to_camera_matrices.shape[0]
+    dtype = projection_matrices.dtype
+    device = projection_matrices.device
+
+    xs = torch.arange(image_width, device=device, dtype=dtype) + 0.5
+    ys = torch.arange(image_height, device=device, dtype=dtype) + 0.5
+    fx = projection_matrices[:, 0, 0]
+    fy = projection_matrices[:, 1, 1]
+    cx = projection_matrices[:, 0, 2]
+    cy = projection_matrices[:, 1, 2]
+
+    origins_camera = torch.zeros((C, image_height, image_width, 3), device=device, dtype=dtype)
+    origins_camera[..., 0] = ((xs[None, :] - cx[:, None]) / fx[:, None])[:, None, :]
+    origins_camera[..., 1] = ((ys[None, :] - cy[:, None]) / fy[:, None])[:, :, None]
+
+    rotation_camera_to_world = world_to_camera_matrices[:, :3, :3].transpose(1, 2)
+    translation_world_to_camera = world_to_camera_matrices[:, :3, 3]
+    origins_world = torch.einsum(
+        "cij,chwj->chwi",
+        rotation_camera_to_world,
+        origins_camera - translation_world_to_camera[:, None, None, :],
+    )
+    directions_world = F.normalize(rotation_camera_to_world[:, :, 2], dim=-1)
+    directions_world = directions_world[:, None, None, :].expand(C, image_height, image_width, 3)
+    return torch.cat((origins_world, directions_world), dim=-1).contiguous()
+
+
+def _split_distortion_coeffs_for_gsplat(
+    distortion_coeffs: torch.Tensor,
+    camera_model: CameraModel,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if camera_model in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
+        return None, None, None
+    return distortion_coeffs.split((6, 2, 4), dim=-1)
+
+
+def _evaluate_gaussian_sh(
+    sh_degree_to_use: int,
+    num_cameras: int,
+    view_dirs: torch.Tensor | None,
+    sh0_coeffs: torch.Tensor,
+    shN_coeffs: torch.Tensor | None,
+    radii: torch.Tensor,
+) -> torch.Tensor:
+    if shN_coeffs is None:
+        shN_coeffs = sh0_coeffs.new_empty(sh0_coeffs.shape[0], 0, sh0_coeffs.shape[2])
+    coeffs = torch.cat([sh0_coeffs, shN_coeffs], dim=1)
+    if view_dirs is None or view_dirs.numel() == 0:
+        dirs = coeffs.new_zeros(num_cameras, sh0_coeffs.shape[0], 3)
+    else:
+        dirs = view_dirs
+    masks = (radii > 0).all(dim=-1).contiguous() if radii.numel() > 0 else None
+    colors = gsplat.spherical_harmonics(sh_degree_to_use, dirs, coeffs, masks)
+    if masks is None:
+        return colors + _FVDB_SH_BIAS
+    return torch.where(masks.unsqueeze(-1), colors + _FVDB_SH_BIAS, colors.new_zeros(()))
 
 
 class ProjectedGaussianSplats:
@@ -1455,6 +1541,40 @@ class GaussianSplat3d:
     def _use_ut(camera_model: CameraModel, projection_method: ProjectionMethod) -> bool:
         return GaussianSplat3d._resolve_projection_method(camera_model, projection_method) == ProjectionMethod.UNSCENTED
 
+    @staticmethod
+    def _attach_projection_accumulators(
+        means2d: torch.Tensor,
+        radii: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        accum_grad_norms: torch.Tensor | None,
+        accum_step_counts: torch.Tensor | None,
+        accum_max_radii: torch.Tensor | None,
+    ) -> None:
+        if not means2d.requires_grad:
+            return
+        if accum_grad_norms is None and accum_step_counts is None and accum_max_radii is None:
+            return
+
+        radii_for_hook = radii.detach()
+
+        def _accumulate(grad: torch.Tensor) -> torch.Tensor:
+            visible = (radii_for_hook > 0).all(dim=-1)
+            if accum_grad_norms is not None and accum_step_counts is not None:
+                c_total = visible.size(0)
+                sx = grad[..., 0] * (float(image_width) * 0.5 * c_total)
+                sy = grad[..., 1] * (float(image_height) * 0.5 * c_total)
+                norm = torch.sqrt(sx * sx + sy * sy)
+                masked_norm = torch.where(visible, norm, norm.new_zeros(()))
+                accum_grad_norms.add_(masked_norm.sum(dim=0).to(accum_grad_norms.dtype))
+                accum_step_counts.add_(visible.sum(dim=0).to(accum_step_counts.dtype))
+                if accum_max_radii is not None:
+                    max_r = radii_for_hook.amax(dim=-1).amax(dim=0).to(accum_max_radii.dtype)
+                    accum_max_radii.copy_(torch.maximum(accum_max_radii, max_r))
+            return grad
+
+        means2d.register_hook(_accumulate)
+
     def _do_projection(
         self,
         w2c: torch.Tensor,
@@ -1548,29 +1668,38 @@ class GaussianSplat3d:
                 compensations = None
             return radii, means2d, depths, conics, compensations
 
-        result = _ProjectGaussiansFn.apply(
+        result = gsplat.fully_fused_projection(
             means,
+            None,
             quats,
-            log_scales,
+            log_scales.exp(),
             w2c,
             K,
             W,
             H,
-            eps2d,
-            near,
-            far,
-            min_radius,
-            antialias,
-            ortho,
-            accum_grad_norms,
-            accum_step_counts,
-            accum_max_radii,
+            eps2d=eps2d,
+            near_plane=near,
+            far_plane=far,
+            radius_clip=min_radius,
+            packed=False,
+            sparse_grad=False,
+            calc_compensations=antialias,
+            camera_model="ortho" if ortho else "pinhole",
         )
         radii = result[0]
         means2d = result[1]
         depths = result[2]
         conics = result[3]
-        compensations = result[4] if antialias and len(result) > 4 else None
+        compensations = result[4] if antialias else None
+        self._attach_projection_accumulators(
+            means2d,
+            radii,
+            W,
+            H,
+            accum_grad_norms,
+            accum_step_counts,
+            accum_max_radii,
+        )
         return radii, means2d, depths, conics, compensations
 
     def _eval_sh(
@@ -1597,11 +1726,11 @@ class GaussianSplat3d:
             # NOTE: view_dirs are not normalized here; the SH evaluation kernel
             # normalizes them internally.
             view_dirs = means[None, :, :] - cam_to_world[:, None, :3, 3]
-            return _EvaluateGaussianSHFn.apply(sh_degree_to_use, C, view_dirs, sh0, shN, radii)
+            return _evaluate_gaussian_sh(sh_degree_to_use, C, view_dirs, sh0, shN, radii)
         else:
             view_dirs = means.new_empty(0)
             shN = sh0.new_empty(sh0.shape[0], 0, sh0.shape[2])
-            return _EvaluateGaussianSHFn.apply(sh_degree_to_use, C, view_dirs, sh0, shN, radii)
+            return _evaluate_gaussian_sh(sh_degree_to_use, C, view_dirs, sh0, shN, radii)
 
     def _make_render_features(
         self,
@@ -1658,22 +1787,21 @@ class GaussianSplat3d:
         """
         num_tiles_h = math.ceil(H / tile_size)
         num_tiles_w = math.ceil(W / tile_size)
-        _tiles_per_gauss, isect_ids, tile_gaussian_ids = torch.ops.gsplat.intersect_tile(
+        _tiles_per_gauss, isect_ids, tile_gaussian_ids = gsplat.isect_tiles(
             means2d,
             radii,
             depths,
-            None,  # conics — stay on the AABB path (fvdb has no AccuTile counterpart)
-            None,  # opacities
-            None,  # image_ids — unpacked only
-            None,  # gaussian_ids — unpacked only
-            C,
             tile_size,
             num_tiles_w,
             num_tiles_h,
-            True,  # sort by (cam, tile, depth)
-            False,  # segmented sort off
+            sort=True,
+            segmented=False,
+            packed=False,
+            n_images=C,
+            conics=None,  # stay on the AABB path (fvdb has no AccuTile counterpart)
+            opacities=None,
         )
-        tile_offsets = torch.ops.gsplat.intersect_offset(isect_ids, C, num_tiles_w, num_tiles_h)
+        tile_offsets = gsplat.isect_offset_encode(isect_ids, C, num_tiles_w, num_tiles_h)
         return tile_offsets, tile_gaussian_ids, num_tiles_h, num_tiles_w
 
     def _intersect_tiles_sparse(
@@ -1693,15 +1821,16 @@ class GaussianSplat3d:
         """
         num_tiles_h = math.ceil(H / tile_size)
         num_tiles_w = math.ceil(W / tile_size)
-        active_tiles, active_tile_mask, tile_pixel_mask, tile_pixel_cumsum, pixel_map = (
-            _C.build_sparse_gaussian_tile_layout(
-                tile_size,
-                num_tiles_w,
-                num_tiles_h,
-                pixels_jt._impl,
-            )
+        image_ids = pixels_jt.jidx.to(torch.int32).contiguous()
+        active_tiles, active_tile_mask, tile_pixel_mask, tile_pixel_cumsum, pixel_map = gsplat.build_sparse_tile_layout(
+            pixels_jt.jdata,
+            image_ids,
+            C,
+            tile_size,
+            num_tiles_w,
+            num_tiles_h,
         )
-        tile_offsets, tile_gaussian_ids = _C.intersect_gaussian_tiles_sparse(
+        tile_offsets, tile_gaussian_ids = gsplat.isect_tiles_sparse(
             means2d,
             radii,
             depths,
@@ -1709,8 +1838,8 @@ class GaussianSplat3d:
             active_tiles,
             C,
             tile_size,
-            num_tiles_h,
             num_tiles_w,
+            num_tiles_h,
         )
         return tile_offsets, tile_gaussian_ids, active_tiles, tile_pixel_mask, tile_pixel_cumsum, pixel_map
 
@@ -1728,25 +1857,22 @@ class GaussianSplat3d:
         backgrounds: torch.Tensor | None,
         tile_masks: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return cast(
-            tuple[torch.Tensor, torch.Tensor],
-            _RasterizeScreenSpaceGaussiansFn.apply(
-                means2d,
-                conics,
-                features,
-                opacities,
-                W,
-                H,
-                0,
-                0,
-                tile_size,
-                tile_offsets,
-                tile_gaussian_ids,
-                False,
-                backgrounds,
-                tile_masks,
-            ),
+        rendered_features, rendered_alphas = gsplat.rasterize_to_pixels(
+            means2d,
+            conics,
+            features,
+            opacities,
+            W,
+            H,
+            tile_size,
+            tile_offsets,
+            tile_gaussian_ids,
+            backgrounds=backgrounds,
+            masks=tile_masks,
+            packed=False,
+            absgrad=False,
         )
+        return _apply_tile_mask(rendered_features, rendered_alphas, tile_masks, tile_size, W, H, backgrounds)
 
     def _rasterize_screen_space_sparse(
         self,
@@ -1767,30 +1893,47 @@ class GaussianSplat3d:
         backgrounds: torch.Tensor | None,
         masks: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return cast(
-            tuple[torch.Tensor, torch.Tensor],
-            _RasterizeScreenSpaceGaussiansSparseFn.apply(
-                means2d,
-                conics,
-                features,
-                opacities,
-                pixels_jt,
-                W,
-                H,
-                0,
-                0,
-                tile_size,
-                tile_offsets,
-                tile_gaussian_ids,
-                active_tiles,
-                tile_pixel_mask,
-                tile_pixel_cumsum,
-                pixel_map,
-                False,
-                backgrounds,
-                masks,
-            ),
+        num_tiles_h = math.ceil(H / tile_size)
+        num_tiles_w = math.ceil(W / tile_size)
+        image_ids = pixels_jt.jidx.to(torch.int32).contiguous()
+        rendered_features, rendered_alphas = gsplat.rasterize_to_pixels_sparse(
+            means2d,
+            conics,
+            features,
+            opacities,
+            image_ids,
+            active_tiles,
+            tile_offsets,
+            tile_gaussian_ids,
+            tile_pixel_mask,
+            tile_pixel_cumsum,
+            pixel_map,
+            W,
+            H,
+            tile_size,
+            num_tiles_w,
+            num_tiles_h,
+            backgrounds=backgrounds,
+            masks=masks,
+            packed=False,
+            absgrad=False,
         )
+        if masks is None:
+            return rendered_features, rendered_alphas
+
+        pixels = pixels_jt.jdata
+        rows = pixels[:, 0].long()
+        cols = pixels[:, 1].long()
+        tile_y = torch.div(rows, tile_size, rounding_mode="floor")
+        tile_x = torch.div(cols, tile_size, rounding_mode="floor")
+        valid = masks[image_ids.long(), tile_y, tile_x]
+        if backgrounds is not None:
+            masked_features = backgrounds[image_ids.long()]
+        else:
+            masked_features = rendered_features.new_zeros(rendered_features.shape)
+        rendered_features = torch.where(valid.unsqueeze(-1), rendered_features, masked_features)
+        rendered_alphas = torch.where(valid.unsqueeze(-1), rendered_alphas, rendered_alphas.new_zeros(()))
+        return rendered_features, rendered_alphas
 
     def _rasterize_world_space(
         self,
@@ -1808,31 +1951,34 @@ class GaussianSplat3d:
         backgrounds: torch.Tensor | None,
         tile_masks: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return cast(
-            tuple[torch.Tensor, torch.Tensor],
-            _RasterizeWorldSpaceGaussiansFn.apply(
-                self._means,
-                self._quats,
-                self._log_scales,
-                features,
-                opacities,
-                w2c,
-                w2c,
-                K,
-                distortion_coeffs,
-                _C.RollingShutterType.NONE.value,
-                self._camera_model_to_cpp(camera_model).value,
-                W,
-                H,
-                0,
-                0,
-                tile_size,
-                tile_offsets,
-                tile_gaussian_ids,
-                backgrounds,
-                tile_masks,
-            ),
+        radial, tangential, thin_prism = _split_distortion_coeffs_for_gsplat(distortion_coeffs, camera_model)
+        rays = None
+        if camera_model == CameraModel.ORTHOGRAPHIC:
+            # gsplat's eval3d kernels accept explicit rays but do not currently generate
+            # orthographic rays internally.
+            rays = _make_orthographic_rays(w2c, K, W, H)
+        rendered_features, rendered_alphas = gsplat.rasterize_to_pixels_eval3d(
+            self._means,
+            self._quats,
+            self._log_scales.exp(),
+            features,
+            opacities,
+            w2c,
+            K,
+            W,
+            H,
+            tile_size,
+            tile_offsets,
+            tile_gaussian_ids,
+            backgrounds=backgrounds,
+            masks=tile_masks,
+            camera_model=_gsplat_camera_model(camera_model),
+            rays=rays,
+            radial_coeffs=radial,
+            tangential_coeffs=tangential,
+            thin_prism_coeffs=thin_prism,
         )
+        return rendered_features, rendered_alphas
 
     @staticmethod
     def _deduplicate_pixels(
@@ -1948,9 +2094,14 @@ class GaussianSplat3d:
         opacities = self._make_opacities(C, compensations, antialias)
         features = self._make_render_features(w2c, radii, depths, sh_degree_to_use, include_colors, include_depth)
 
-        tile_offsets, tile_gaussian_ids, active_tiles, tile_pixel_mask, tile_pixel_cumsum, pixel_map = (
-            self._intersect_tiles_sparse(render_pixels, means2d, radii, depths, C, tile_size, W, H)
-        )
+        (
+            tile_offsets,
+            tile_gaussian_ids,
+            active_tiles,
+            tile_pixel_mask,
+            tile_pixel_cumsum,
+            pixel_map,
+        ) = self._intersect_tiles_sparse(render_pixels, means2d, radii, depths, C, tile_size, W, H)
 
         rendered_jdata, alphas_jdata = self._rasterize_screen_space_sparse(
             render_pixels,
@@ -2480,42 +2631,29 @@ class GaussianSplat3d:
         tile_masks = _pixel_mask_to_tile_mask(masks, tile_size) if masks is not None else None
 
         if is_crop:
-            num_tiles_h = math.ceil(raster_h / tile_size)
-            num_tiles_w = math.ceil(raster_w / tile_size)
-            _tiles_per_gauss, isect_ids, tile_gaussian_ids = torch.ops.gsplat.intersect_tile(
-                pg.means2d,
+            crop_offset = pg.means2d.new_tensor([origin_w, origin_h])
+            crop_means2d = pg.means2d - crop_offset
+            tile_offsets, tile_gaussian_ids, _, _ = self._intersect_tiles(
+                crop_means2d,
                 pg.radii,
                 pg.depths,
-                None,  # conics — stay on the AABB path (fvdb has no AccuTile counterpart)
-                None,  # opacities
-                None,  # image_ids — unpacked only
-                None,  # gaussian_ids — unpacked only
                 C,
                 tile_size,
-                num_tiles_w,
-                num_tiles_h,
-                True,  # sort by (cam, tile, depth)
-                False,  # segmented sort off
+                raster_w,
+                raster_h,
             )
-            tile_offsets = torch.ops.gsplat.intersect_offset(isect_ids, C, num_tiles_w, num_tiles_h)
-            features, alphas = cast(
-                tuple[torch.Tensor, torch.Tensor],
-                _RasterizeScreenSpaceGaussiansFn.apply(
-                    pg.means2d,
-                    pg.inv_covar_2d,
-                    pg.render_quantities,
-                    pg.opacities,
-                    raster_w,
-                    raster_h,
-                    origin_w,
-                    origin_h,
-                    tile_size,
-                    tile_offsets,
-                    tile_gaussian_ids,
-                    False,
-                    backgrounds,
-                    tile_masks,
-                ),
+            features, alphas = self._rasterize_screen_space(
+                crop_means2d,
+                pg.inv_covar_2d,
+                pg.render_quantities,
+                pg.opacities,
+                raster_w,
+                raster_h,
+                tile_size,
+                tile_offsets,
+                tile_gaussian_ids,
+                backgrounds,
+                tile_masks,
             )
         else:
             tile_offsets, tile_gaussian_ids, _, _ = self._intersect_tiles(
@@ -3851,17 +3989,22 @@ class GaussianSplat3d:
             )
             C = world_to_camera_matrices.size(0)
             opacities = self._make_opacities(C, compensations, antialias)
-            tile_offsets, tile_gaussian_ids, active_tiles, tile_pixel_mask, tile_pixel_cumsum, pixel_map = (
-                self._intersect_tiles_sparse(
-                    unique_pixels_jt,
-                    means2d,
-                    radii,
-                    depths,
-                    C,
-                    tile_size,
-                    image_width,
-                    image_height,
-                )
+            (
+                tile_offsets,
+                tile_gaussian_ids,
+                active_tiles,
+                tile_pixel_mask,
+                tile_pixel_cumsum,
+                pixel_map,
+            ) = self._intersect_tiles_sparse(
+                unique_pixels_jt,
+                means2d,
+                radii,
+                depths,
+                C,
+                tile_size,
+                image_width,
+                image_height,
             )
             result_ncg, result_alphas = _C.sparse_rasterize_num_contributing_gaussians(
                 means2d,
@@ -4138,17 +4281,22 @@ class GaussianSplat3d:
             )
             C = world_to_camera_matrices.size(0)
             opacities = self._make_opacities(C, compensations, antialias)
-            tile_offsets, tile_gaussian_ids, active_tiles, tile_pixel_mask, tile_pixel_cumsum, pixel_map = (
-                self._intersect_tiles_sparse(
-                    unique_pixels_jt,
-                    means2d,
-                    radii,
-                    depths,
-                    C,
-                    tile_size,
-                    image_width,
-                    image_height,
-                )
+            (
+                tile_offsets,
+                tile_gaussian_ids,
+                active_tiles,
+                tile_pixel_mask,
+                tile_pixel_cumsum,
+                pixel_map,
+            ) = self._intersect_tiles_sparse(
+                unique_pixels_jt,
+                means2d,
+                radii,
+                depths,
+                C,
+                tile_size,
+                image_width,
+                image_height,
             )
             ncg_jt = None
             if top_k_contributors <= 0:
