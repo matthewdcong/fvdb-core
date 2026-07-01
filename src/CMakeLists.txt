@@ -98,8 +98,6 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticBackward.cu
     fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticForward.cu
     fvdb/detail/ops/gsplat/ProjectGaussiansUnscentedForward.cu
-    fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticJaggedBackward.cu
-    fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticJaggedForward.cu
     fvdb/detail/ops/gsplat/RasterizeScreenSpaceGaussiansBackward.cu
     fvdb/detail/ops/gsplat/RasterizeScreenSpaceGaussiansForward.cu
     fvdb/detail/ops/gsplat/RasterizeWorldSpaceGaussiansBackward.cu

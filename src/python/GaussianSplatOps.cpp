@@ -25,8 +25,6 @@
 #include <fvdb/detail/ops/gsplat/IntersectGaussianTiles.h>
 #include <fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticBackward.h>
 #include <fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticForward.h>
-#include <fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticJaggedBackward.h>
-#include <fvdb/detail/ops/gsplat/ProjectGaussiansAnalyticJaggedForward.h>
 #include <fvdb/detail/ops/gsplat/ProjectGaussiansUnscentedForward.h>
 #include <fvdb/detail/ops/gsplat/RasterizeScreenSpaceGaussiansBackward.h>
 #include <fvdb/detail/ops/gsplat/RasterizeScreenSpaceGaussiansForward.h>
@@ -378,43 +376,6 @@ bind_gaussian_splat_ops(py::module &m) {
           py::arg("d_loss_d_rendered_alphas"),
           py::arg("backgrounds"),
           py::arg("masks"));
-
-    m.def("project_gaussians_analytic_jagged_fwd",
-          &ops::projectGaussiansAnalyticJaggedFwd,
-          py::arg("g_sizes"),
-          py::arg("means"),
-          py::arg("quats"),
-          py::arg("scales"),
-          py::arg("c_sizes"),
-          py::arg("world_to_cam_matrices"),
-          py::arg("projection_matrices"),
-          py::arg("image_width"),
-          py::arg("image_height"),
-          py::arg("eps2d"),
-          py::arg("near"),
-          py::arg("far"),
-          py::arg("min_radius_2d"),
-          py::arg("ortho"));
-
-    m.def("project_gaussians_analytic_jagged_bwd",
-          &ops::projectGaussiansAnalyticJaggedBwd,
-          py::arg("g_sizes"),
-          py::arg("means"),
-          py::arg("quats"),
-          py::arg("scales"),
-          py::arg("c_sizes"),
-          py::arg("world_to_cam_matrices"),
-          py::arg("projection_matrices"),
-          py::arg("image_width"),
-          py::arg("image_height"),
-          py::arg("eps2d"),
-          py::arg("radii"),
-          py::arg("conics"),
-          py::arg("d_loss_d_means2d"),
-          py::arg("d_loss_d_depths"),
-          py::arg("d_loss_d_conics"),
-          py::arg("world_to_cam_matrices_requires_grad"),
-          py::arg("ortho"));
 
     // ------- Tile intersection (non-differentiable) -------
 

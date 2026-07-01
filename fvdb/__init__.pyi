@@ -65,30 +65,6 @@ from .torch_jagged import (
     where,
 )
 
-def gaussian_render_jagged(
-    means: JaggedTensor,
-    quats: JaggedTensor,
-    scales: JaggedTensor,
-    opacities: JaggedTensor,
-    sh_coeffs: JaggedTensor,
-    viewmats: JaggedTensor,
-    Ks: JaggedTensor,
-    image_width: int,
-    image_height: int,
-    near_plane: float = 0.01,
-    far_plane: float = 1e10,
-    sh_degree_to_use: int = -1,
-    tile_size: int = 16,
-    radius_clip: float = 0.0,
-    eps2d: float = 0.3,
-    antialias: bool = False,
-    render_depth_channel: bool = False,
-    return_debug_info: bool = False,
-    render_depth_only: bool = False,
-    ortho: bool = False,
-    backgrounds: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]: ...
-
 __all__ = [
     # Core classes
     "GridBatch",
@@ -113,7 +89,6 @@ __all__ = [
     # Specialized operations
     "scaled_dot_product_attention",
     "volume_render",
-    "gaussian_render_jagged",
     # Torch-compatible functions (work with both Tensor and JaggedTensor)
     "relu",
     "relu_",
