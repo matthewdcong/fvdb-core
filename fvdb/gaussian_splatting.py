@@ -69,40 +69,6 @@ def _gsplat_camera_model(camera_model: CameraModel) -> str:
     return "ortho" if camera_model == CameraModel.ORTHOGRAPHIC else "pinhole"
 
 
-def _make_orthographic_rays(
-    world_to_camera_matrices: torch.Tensor,
-    projection_matrices: torch.Tensor,
-    image_width: int,
-    image_height: int,
-) -> torch.Tensor:
-    """Build world-space orthographic rays in gsplat's ``[C, H, W, 6]`` layout."""
-    C = world_to_camera_matrices.shape[0]
-    dtype = projection_matrices.dtype
-    device = projection_matrices.device
-
-    xs = torch.arange(image_width, device=device, dtype=dtype) + 0.5
-    ys = torch.arange(image_height, device=device, dtype=dtype) + 0.5
-    fx = projection_matrices[:, 0, 0]
-    fy = projection_matrices[:, 1, 1]
-    cx = projection_matrices[:, 0, 2]
-    cy = projection_matrices[:, 1, 2]
-
-    origins_camera = torch.zeros((C, image_height, image_width, 3), device=device, dtype=dtype)
-    origins_camera[..., 0] = ((xs[None, :] - cx[:, None]) / fx[:, None])[:, None, :]
-    origins_camera[..., 1] = ((ys[None, :] - cy[:, None]) / fy[:, None])[:, :, None]
-
-    rotation_camera_to_world = world_to_camera_matrices[:, :3, :3].transpose(1, 2)
-    translation_world_to_camera = world_to_camera_matrices[:, :3, 3]
-    origins_world = torch.einsum(
-        "cij,chwj->chwi",
-        rotation_camera_to_world,
-        origins_camera - translation_world_to_camera[:, None, None, :],
-    )
-    directions_world = F.normalize(rotation_camera_to_world[:, :, 2], dim=-1)
-    directions_world = directions_world[:, None, None, :].expand(C, image_height, image_width, 3)
-    return torch.cat((origins_world, directions_world), dim=-1).contiguous()
-
-
 def _split_distortion_coeffs_for_gsplat(
     distortion_coeffs: torch.Tensor,
     camera_model: CameraModel,
@@ -1544,10 +1510,6 @@ class GaussianSplat3d:
     # ---------------------------------------------------------------------------
 
     @staticmethod
-    def _is_ortho(camera_model: CameraModel) -> bool:
-        return camera_model == CameraModel.ORTHOGRAPHIC
-
-    @staticmethod
     def _resolve_projection_method(camera_model: CameraModel, projection_method: ProjectionMethod) -> ProjectionMethod:
         if projection_method != ProjectionMethod.AUTO:
             return projection_method
@@ -1615,7 +1577,6 @@ class GaussianSplat3d:
         means = self._means
         quats = self._quats
         log_scales = self._log_scales
-        ortho = self._is_ortho(camera_model)
 
         C = w2c.size(0)
         if not K.is_contiguous():
@@ -1661,9 +1622,7 @@ class GaussianSplat3d:
                 self._accumulated_max_2d_radii = mr
             accum_max_radii = mr
 
-        # Orthographic projection is affine, so analytic covariance propagation is
-        # the exact UT result. gsplat's UT kernel does not have an orthographic branch.
-        if self._use_ut(camera_model, projection_method) and not ortho:
+        if self._use_ut(camera_model, projection_method):
             if distortion_coeffs is None:
                 radial = tangential = thin_prism = None
             else:
@@ -1709,7 +1668,7 @@ class GaussianSplat3d:
             packed=False,
             sparse_grad=False,
             calc_compensations=antialias,
-            camera_model="ortho" if ortho else "pinhole",
+            camera_model=_gsplat_camera_model(camera_model),
         )
         radii = result[0]
         means2d = result[1]
@@ -1961,11 +1920,6 @@ class GaussianSplat3d:
         tile_masks: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         radial, tangential, thin_prism = _split_distortion_coeffs_for_gsplat(distortion_coeffs, camera_model)
-        rays = None
-        if camera_model == CameraModel.ORTHOGRAPHIC:
-            # gsplat's eval3d kernels accept explicit rays but do not currently generate
-            # orthographic rays internally.
-            rays = _make_orthographic_rays(w2c, K, W, H)
         rendered_features, rendered_alphas = gsplat.rasterize_to_pixels_eval3d(
             self._means,
             self._quats,
@@ -1982,7 +1936,6 @@ class GaussianSplat3d:
             backgrounds=backgrounds,
             masks=tile_masks,
             camera_model=_gsplat_camera_model(camera_model),
-            rays=rays,
             radial_coeffs=radial,
             tangential_coeffs=tangential,
             thin_prism_coeffs=thin_prism,
