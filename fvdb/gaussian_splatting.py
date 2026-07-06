@@ -125,13 +125,14 @@ def _evaluate_gaussian_sh(
 ) -> torch.Tensor:
     if shN_coeffs is None:
         shN_coeffs = sh0_coeffs.new_empty(sh0_coeffs.shape[0], 0, sh0_coeffs.shape[2])
-    coeffs = torch.cat([sh0_coeffs, shN_coeffs], dim=1)
     if view_dirs is None or view_dirs.numel() == 0:
-        dirs = coeffs.new_zeros(num_cameras, sh0_coeffs.shape[0], 3)
+        dirs = sh0_coeffs.new_zeros(num_cameras, sh0_coeffs.shape[0], 3)
     else:
         dirs = view_dirs
     masks = (radii > 0).all(dim=-1).contiguous() if radii.numel() > 0 else None
-    colors = gsplat.spherical_harmonics(sh_degree_to_use, dirs, coeffs, masks)
+    colors = gsplat.spherical_harmonics_l0(sh0_coeffs) + gsplat.spherical_harmonics_l1_plus(
+        sh_degree_to_use, dirs, shN_coeffs, masks
+    )
     if masks is None:
         return colors + _FVDB_SH_BIAS
     return torch.where(masks.unsqueeze(-1), colors + _FVDB_SH_BIAS, colors.new_zeros(()))
