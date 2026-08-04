@@ -436,7 +436,7 @@ elif [ "$BUILD_TYPE" == "ctest" ]; then
     # This discovers all tests from both src/tests/ and src/dispatch/
     BUILD_DIR="$(dirname "$CMAKE_CACHE")/src"
 
-    if [ ! -f "$BUILD_DIR/CTestTestfile.cmake" ]; then
+    if ! grep -Eiq '^FVDB_BUILD_TESTS:BOOL=(1|ON|TRUE|YES|Y)$' "$CMAKE_CACHE" || [ ! -f "$BUILD_DIR/CTestTestfile.cmake" ]; then
         echo "Error: No CTestTestfile.cmake found in $BUILD_DIR"
         echo "Please enable tests by building with:"
         echo "pip install . -C cmake.define.FVDB_BUILD_TESTS=ON"
@@ -452,7 +452,7 @@ elif [ "$BUILD_TYPE" == "ctest" ]; then
     # Note: ctest doesn't need path sanitization as it doesn't search for libraries
     pushd "$BUILD_DIR" > /dev/null
     echo "Running ctest..."
-    ctest --output-on-failure -LE compile_fail
+    ctest --output-on-failure -LE compile_fail --no-tests=error
     CTEST_EXIT_CODE=$?
     popd > /dev/null # Back to SOURCE_DIR
 
