@@ -63,7 +63,7 @@ struct RasterizeForwardArgs {
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt)        // [AP]
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt) // [AP]
         : commonArgs(means2d,
                      conics,
                      opacities,
@@ -248,8 +248,8 @@ struct RasterizeForwardArgs {
 
                 // Skip the per-Gaussian inner loop if every lane in this warp is
                 // already done (saturated or outside image bounds). Block-level
-                // __syncthreads_and above only fires once all 8 warps finish.
-                if (!__all_sync(0xffffffffu, done)) {
+                // __syncthreads_and above only fires once all warps in the block finish.
+                if (!__all_sync(__activemask(), done)) {
                     const int64_t remaining = lastGaussianIdInBlock - batchStart;
                     const uint32_t batchSize =
                         static_cast<uint32_t>(remaining < blockSize ? remaining : blockSize);

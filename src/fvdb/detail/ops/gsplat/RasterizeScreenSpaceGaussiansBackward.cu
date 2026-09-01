@@ -78,7 +78,7 @@ struct RasterizeBackwardArgs {
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt)        // [AP]
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt) // [AP]
         : commonArgs(means2d,
                      conics,
                      opacities,
@@ -605,17 +605,15 @@ struct RasterizeBackwardArgs {
     /// @param i The row index of the pixel
     /// @param j The column index of the pixel
     /// @param firstGaussianIdInBlock The ID of the first Gaussian in the block
-    template <size_t WARP_TILE_SIZE>
     inline __device__ void
-    volumeRenderTileBackward( // const cooperative_groups::thread_block_tile<WARP_TILE_SIZE> &warp,
-        const uint32_t cameraId,
-        const uint32_t row,
-        const uint32_t col,
-        const int64_t firstGaussianIdInBlock,
-        const int64_t lastGaussianIdInBlock,
-        const uint32_t blockSize,
-        const bool pixelIsActive,
-        const uint32_t activePixelIndex) {
+    volumeRenderTileBackward(const uint32_t cameraId,
+                             const uint32_t row,
+                             const uint32_t col,
+                             const int64_t firstGaussianIdInBlock,
+                             const int64_t lastGaussianIdInBlock,
+                             const uint32_t blockSize,
+                             const bool pixelIsActive,
+                             const uint32_t activePixelIndex) {
         alignas(Gaussian2D<ScalarType>) extern __shared__ char s[];
 
         Gaussian2D<ScalarType> *sharedGaussians =
@@ -646,10 +644,8 @@ struct RasterizeBackwardArgs {
             lastIntersectionOffset = readLastId(pixIdx);
         }
 
-        namespace cg = cooperative_groups;
-        auto block   = cg::this_thread_block();
-        const cg::thread_block_tile<WARP_TILE_SIZE> warp =
-            cg::tiled_partition<WARP_TILE_SIZE>(block);
+        namespace cg                   = cooperative_groups;
+        const cg::coalesced_group warp = cg::coalesced_threads();
 
         const int32_t lastIntersectionOffsetInWarp = warpMax(lastIntersectionOffset, warp);
 
@@ -864,15 +860,14 @@ rasterizeGaussiansBackward(
 
     // Compute the backward pass for the current tile starting at pixel (i, j)
     // and containing Gaussians with ids in [firstGaussianIdInBlock, lastGaussianIdInBlock)
-    constexpr uint32_t WARP_TILE_SIZE = 32; // TODO (fwilliams): Tune this value
-    args.template volumeRenderTileBackward<WARP_TILE_SIZE>(cameraId,
-                                                           row,
-                                                           col,
-                                                           firstGaussianIdInBlock,
-                                                           lastGaussianIdInBlock,
-                                                           blockDim.x * blockDim.y,
-                                                           pixelInImage,
-                                                           activePixelIndex);
+    args.volumeRenderTileBackward(cameraId,
+                                  row,
+                                  col,
+                                  firstGaussianIdInBlock,
+                                  lastGaussianIdInBlock,
+                                  blockDim.x * blockDim.y,
+                                  pixelInImage,
+                                  activePixelIndex);
 }
 
 /// @brief Get the shared memory requirements for the backward pass kernel
