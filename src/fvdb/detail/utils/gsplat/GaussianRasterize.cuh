@@ -14,7 +14,6 @@
 
 #include <nanovdb/math/Math.h>
 
-#include <cub/block/block_scan.cuh>
 #include <cuda/std/tuple>
 
 namespace fvdb::detail::ops {
@@ -149,7 +148,7 @@ template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct Raste
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt)        // [AP]
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt) // [AP]
         : mRenderWindow(renderWindow), mTileOriginW(renderWindow.originW / tileSize),
           mTileOriginH(renderWindow.originH / tileSize), mTileSize(tileSize),
           mMeans2d(initAccessor<ScalarType, NUM_OUTER_DIMS + 1>(means2d, "means2d")),
@@ -290,20 +289,29 @@ template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct Raste
     // Get the index of the current pixel in the current block
     inline __device__ cuda::std::tuple<bool, uint32_t>
     activePixelIndex(uint32_t row, uint32_t col) {
-        uint32_t index    = 0;
-        bool pixelInImage = mIsSparse ? tilePixelActive()
-                                      : (row < mRenderWindow.height && col < mRenderWindow.width);
-
-        if (mIsSparse) {
-            // Use CUB BlockScan to compute the index of each active pixel in the block
-            __shared__
-            typename cub::BlockScan<uint32_t, 16, cub::BLOCK_SCAN_RAKING, 16>::TempStorage
-                tempStorage;
-
-            cub::BlockScan<uint32_t, 16, cub::BLOCK_SCAN_RAKING, 16>(tempStorage)
-                .ExclusiveSum(pixelInImage, index);
-            __syncthreads();
+        if (!mIsSparse) {
+            return {row < mRenderWindow.height && col < mRenderWindow.width, 0};
         }
+
+        // The active-pixel index is the number of set bits preceding this thread's pixel in
+        // raster order. Computing it directly from the sparse tile bitmask supports any valid
+        // tile block size, including a 4x4 block containing only half a warp.
+        const uint32_t tileOrdinal = blockIdx.x + mBlockOffset;
+        const uint32_t bitIndex    = threadIdx.y * mTileSize + threadIdx.x;
+        const uint32_t wordIndex   = bitmaskWordIndex(bitIndex);
+        const uint32_t bitInWord   = bitmaskBitIndex(bitIndex);
+
+        uint32_t index = 0;
+        for (uint32_t word = 0; word < wordIndex; ++word) {
+            index += __popcll(mTilePixelMask[tileOrdinal][word]);
+        }
+
+        const uint64_t currentWord = mTilePixelMask[tileOrdinal][wordIndex];
+        const uint64_t precedingBits =
+            bitInWord == 0 ? uint64_t{0} : (uint64_t{1} << bitInWord) - uint64_t{1};
+        index += __popcll(currentWord & precedingBits);
+
+        const bool pixelInImage = currentWord & (uint64_t{1} << bitInWord);
         return {pixelInImage, index};
     }
 
