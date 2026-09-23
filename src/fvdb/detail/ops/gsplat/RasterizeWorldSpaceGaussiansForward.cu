@@ -420,10 +420,6 @@ launchForwardPrivateUse1(const torch::Tensor &means,
     if (contiguousMasks.has_value()) {
         tileTensors.emplace_back(contiguousMasks.value());
     }
-    std::vector<torch::Tensor> cameraTensors = {features, opacities};
-    if (contiguousBackgrounds.has_value()) {
-        cameraTensors.emplace_back(contiguousBackgrounds.value());
-    }
 
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -442,13 +438,6 @@ launchForwardPrivateUse1(const torch::Tensor &means,
                                               imageWidth,
                                               tileSize};
             appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, tileTensors, tileRange);
-            const uint32_t cameraOffset = static_cast<uint32_t>(deviceTileOffset) / tilesPerCamera;
-            const uint32_t cameraCount =
-                cuda::ceil_div(static_cast<uint32_t>(deviceTileOffset + deviceTileCount),
-                               tilesPerCamera) -
-                cameraOffset;
-            appendPerCameraPrefetchRanges(
-                prefetchPointers, prefetchSizes, cameraTensors, cameraOffset, cameraCount);
             memPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, stream);
         }
         C10_CUDA_CHECK(cudaEventRecord(events[deviceId], stream));
