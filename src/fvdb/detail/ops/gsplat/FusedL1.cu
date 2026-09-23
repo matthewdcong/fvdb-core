@@ -1,7 +1,6 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-#include <fvdb/detail/ops/gsplat/FusedImageLossKernels.cuh>
 #include <fvdb/detail/ops/gsplat/FusedL1.h>
 #include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
@@ -265,44 +264,6 @@ reduceL1MapTiles(const torch::Tensor &l1_map,
 
 } // namespace
 
-// Shared launch helpers for the native combined loss. Allocation and spatial
-// prefetching belong to its caller; the standalone L1 interfaces remain below.
-void
-launchFusedL1(int blockOffset,
-              int blockCount,
-              int B,
-              int H,
-              int W,
-              int CH,
-              const float *img1,
-              const float *img2,
-              float *l1_map,
-              cudaStream_t stream) {
-    dim3 grid(blockCount);
-    dim3 block(BLOCK_X, BLOCK_Y);
-    fusedL1Kernel<<<grid, block, 0, stream>>>(blockOffset, B, H, W, CH, img1, img2, l1_map);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void
-launchFusedL1Backward(int blockOffset,
-                      int blockCount,
-                      int B,
-                      int H,
-                      int W,
-                      int CH,
-                      const float *img1,
-                      const float *img2,
-                      const float *grad_loss,
-                      float *grad_img1,
-                      cudaStream_t stream) {
-    dim3 grid(blockCount);
-    dim3 block(BLOCK_X, BLOCK_Y);
-    fusedL1BackwardKernel<<<grid, block, 0, stream>>>(
-        blockOffset, B, H, W, CH, img1, img2, grad_loss, grad_img1, nullptr);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 // ------------------------------------------
 // PyTorch Interface (Forward)
 //   Returns the mean L1 loss over B, CH, H, W.
@@ -322,16 +283,17 @@ fusedL1CUDA(const torch::Tensor &img1, const torch::Tensor &img2) {
     }
     auto l1_map          = torch::empty_like(img1);
     const int blockCount = ((W + BLOCK_X - 1) / BLOCK_X) * ((H + BLOCK_Y - 1) / BLOCK_Y) * B;
-    launchFusedL1(0,
-                  blockCount,
-                  B,
-                  H,
-                  W,
-                  CH,
-                  img1.const_data_ptr<float>(),
-                  img2.const_data_ptr<float>(),
-                  l1_map.data_ptr<float>(),
-                  stream);
+    dim3 grid(blockCount);
+    dim3 block(BLOCK_X, BLOCK_Y);
+    fusedL1Kernel<<<grid, block, 0, stream>>>(0,
+                                              B,
+                                              H,
+                                              W,
+                                              CH,
+                                              img1.const_data_ptr<float>(),
+                                              img2.const_data_ptr<float>(),
+                                              l1_map.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     auto loss = torch::empty({}, img1.options());
     reduceL1MapTiles(l1_map, 0, blockCount, loss.data_ptr<float>(), stream);
     return loss;
@@ -406,16 +368,17 @@ fusedL1PrivateUse1(const torch::Tensor &img1, const torch::Tensor &img2) {
 
         const auto chunk = imageBlockChunk(B, H, W, deviceId);
         if (chunk.blockCount) {
-            launchFusedL1(chunk.blockOffset,
-                          chunk.blockCount,
-                          B,
-                          H,
-                          W,
-                          CH,
-                          img1.const_data_ptr<float>(),
-                          img2.const_data_ptr<float>(),
-                          l1_map.data_ptr<float>(),
-                          stream);
+            dim3 grid(chunk.blockCount);
+            dim3 block(BLOCK_X, BLOCK_Y);
+            fusedL1Kernel<<<grid, block, 0, stream>>>(chunk.blockOffset,
+                                                      B,
+                                                      H,
+                                                      W,
+                                                      CH,
+                                                      img1.const_data_ptr<float>(),
+                                                      img2.const_data_ptr<float>(),
+                                                      l1_map.data_ptr<float>());
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         partial_losses.push_back(torch::empty({1}, img1.options().device(torch::kCUDA, deviceId)));
         reduceL1MapTiles(l1_map,

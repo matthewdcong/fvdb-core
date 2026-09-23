@@ -38,21 +38,19 @@ def fused_l1_ssim_loss(
     img2: torch.Tensor,
     ssim_weight: float,
 ) -> torch.Tensor:
-    """Blend mean L1 and SSIM losses with a spatially tiled gradient merge.
+    """Compute mean L1 and SSIM losses with fused forward and backward kernels.
 
     Computes ``torch.lerp(fused_l1_loss(img1, img2), 1 - ssim(img1, img2),
-    ssim_weight)`` in one native operation using the existing loss kernels and
-    SSIM's default ``same`` padding. Both inputs must be nonempty float32 NCHW
-    images with identical shapes on the same CUDA or DGX device. Noncontiguous
-    inputs are copied to contiguous NCHW storage.
+    ssim_weight)`` using SSIM's default ``same`` padding. Both inputs must be
+    nonempty float32 NCHW images with identical shapes on the same CUDA or DGX
+    device. Noncontiguous inputs are copied to contiguous NCHW storage.
 
-    Forward blends per-pixel L1 and SSIM maps and reduces each 16x16 tile over
-    all channels using SSIM's spatial row ownership. Tile contributions use the
-    full image element count for normalization. Reductions exchange only scalar
-    sums between GPUs. Backward is a single native operation that allocates both
-    gradient buffers, runs the existing backwards, then adds their weighted
-    results in those same tiles.
-    It reuses the L1 gradient buffer and returns one image gradient to autograd.
+    Forward computes L1 and SSIM together and reduces each 16x16 tile over all
+    channels using SSIM's spatial row ownership, without allocating loss maps.
+    Tile contributions use the full image element count for normalization.
+    Reductions exchange only scalar sums between GPUs. The three SSIM derivative
+    tensors are saved for backward, which applies the upstream scalar, computes
+    both gradient contributions, and writes their weighted sum in a single kernel.
     Only first-order gradients for ``img1`` are supported; ``img2`` must not
     require gradients.
 

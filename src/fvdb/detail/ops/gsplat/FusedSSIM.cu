@@ -25,7 +25,6 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-#include <fvdb/detail/ops/gsplat/FusedImageLossKernels.cuh>
 #include <fvdb/detail/ops/gsplat/FusedSSIM.h>
 #include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
@@ -480,78 +479,6 @@ fusedSSIMBackwardKernel(int localToGlobalOffset,
 }
 
 } // namespace
-
-// Shared launch helpers for the native combined loss. Kernel implementations
-// stay in this translation unit, including their shared Gaussian coefficients.
-void
-launchFusedSSIM(int blockOffset,
-                int blockCount,
-                int B,
-                int H,
-                int W,
-                int CH,
-                float C1,
-                float C2,
-                const float *img1,
-                const float *img2,
-                float *ssim_map,
-                float *dm_dmu1,
-                float *dm_dsigma1_sq,
-                float *dm_dsigma12,
-                cudaStream_t stream) {
-    dim3 grid(blockCount);
-    dim3 block(BLOCK_X, BLOCK_Y);
-    fusedSSIMKernel<<<grid, block, 0, stream>>>(blockOffset,
-                                                B,
-                                                H,
-                                                W,
-                                                CH,
-                                                C1,
-                                                C2,
-                                                img1,
-                                                img2,
-                                                ssim_map,
-                                                dm_dmu1,
-                                                dm_dsigma1_sq,
-                                                dm_dsigma12);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void
-launchFusedSSIMBackward(int blockOffset,
-                        int blockCount,
-                        int B,
-                        int H,
-                        int W,
-                        int CH,
-                        float C1,
-                        float C2,
-                        const float *img1,
-                        const float *img2,
-                        const float *grad_map,
-                        float *grad_img1,
-                        const float *dm_dmu1,
-                        const float *dm_dsigma1_sq,
-                        const float *dm_dsigma12,
-                        cudaStream_t stream) {
-    dim3 grid(blockCount);
-    dim3 block(BLOCK_X, BLOCK_Y);
-    fusedSSIMBackwardKernel<<<grid, block, 0, stream>>>(blockOffset,
-                                                        B,
-                                                        H,
-                                                        W,
-                                                        CH,
-                                                        C1,
-                                                        C2,
-                                                        img1,
-                                                        img2,
-                                                        grad_map,
-                                                        grad_img1,
-                                                        dm_dmu1,
-                                                        dm_dsigma1_sq,
-                                                        dm_dsigma12);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
 
 // ------------------------------------------
 // PyTorch Interface (Forward)
