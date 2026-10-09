@@ -1251,7 +1251,7 @@ callRasterizeBackwardPrivateUse1(
     std::vector<torch::Tensor> outDLossDOpacitiesLocals(c10::cuda::device_count());
     std::vector<torch::Tensor> outDLossDMeans2dAbsLocals(c10::cuda::device_count());
 
-    // Prefetch inputs after prior work, then make the current streams wait for those inputs.
+    // Overlap input prefetching with local-gradient initialization on the compute streams.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -1261,6 +1261,14 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
+
+        outDLossDMeans2dLocals[deviceId]   = makeLocalGradient(means2d, deviceId, stream);
+        outDLossDConicsLocals[deviceId]    = makeLocalGradient(conics, deviceId, stream);
+        outDLossDFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, stream);
+        outDLossDOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, stream);
+        if (absGrad) {
+            outDLossDMeans2dAbsLocals[deviceId] = makeLocalGradient(means2d, deviceId, stream);
+        }
 
         int64_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
@@ -1291,14 +1299,6 @@ callRasterizeBackwardPrivateUse1(
 
         uint32_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
-
-        outDLossDMeans2dLocals[deviceId]   = makeLocalGradient(means2d, deviceId, stream);
-        outDLossDConicsLocals[deviceId]    = makeLocalGradient(conics, deviceId, stream);
-        outDLossDFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, stream);
-        outDLossDOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, stream);
-        if (absGrad) {
-            outDLossDMeans2dAbsLocals[deviceId] = makeLocalGradient(means2d, deviceId, stream);
-        }
 
         if (deviceTileCount) {
             RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
