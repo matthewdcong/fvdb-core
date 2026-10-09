@@ -9,6 +9,7 @@
 #include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
 #include <fvdb/detail/utils/cuda/WarpReduce.cuh>
+#include <fvdb/detail/utils/gsplat/CameraGradients.h>
 #include <fvdb/detail/utils/gsplat/GaussianRasterizeFromWorld.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterizeOptionalInputs.h>
 
@@ -42,6 +43,7 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldBackw
     RasterizeFromWorldCommonArgs commonArgs;
     Camera camera;
     uint32_t blockOffset;
+    uint32_t outputCameraOffset;
     // Forward outputs
     fvdb::TorchRAcc64<float, 4> renderedAlphas; // [C,H,W,1]
     fvdb::TorchRAcc64<int32_t, 3> lastIds;      // [C,H,W]
@@ -354,7 +356,8 @@ rasterizeFromWorld3DGSBackwardKernel(
 
             if (warp.thread_rank() == 0) {
                 const int32_t flatId = idBatch[t];
-                const int32_t cid    = flatId / (int32_t)common.means.size(0);
+                const int32_t cid    = flatId / (int32_t)common.means.size(0) -
+                                       args.outputCameraOffset;
                 const int32_t gid    = flatId % (int32_t)common.means.size(0);
 
                 // Per-camera grads
@@ -419,7 +422,8 @@ launchBackwardKernel(const torch::Tensor &means,
                      const torch::Tensor &dOpacities,
                      const uint32_t blockOffset,
                      const uint32_t blockCount,
-                     const cudaStream_t stream) {
+                     const cudaStream_t stream,
+                     const uint32_t outputCameraOffset = 0) {
     const int64_t C = features.size(0);
 
     const uint32_t tileExtentW = (imageWidth + tileSize - 1) / tileSize;
@@ -463,6 +467,7 @@ launchBackwardKernel(const torch::Tensor &means,
         args,
         camera,
         blockOffset,
+        outputCameraOffset,
         renderedAlphas.packed_accessor64<float, 4, torch::RestrictPtrTraits>(),
         lastIds.packed_accessor64<int32_t, 3, torch::RestrictPtrTraits>(),
         dLossDRenderedFeatures.packed_accessor64<float, 4, torch::RestrictPtrTraits>(),
@@ -583,8 +588,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
                 torch::zeros_like(opacities)};
     }
 
-    // Each GPU accumulates into device-local buffers. The managed outputs are populated after the
-    // local gradients have been reduced across devices.
+    // Geometry gradients are shared across cameras. Features and opacities follow tile ownership.
     torch::Tensor dMeans     = torch::empty(means.sizes(), means.options());
     torch::Tensor dQuats     = torch::empty(quats.sizes(), quats.options());
     torch::Tensor dLogScales = torch::empty(logScales.sizes(), logScales.options());
@@ -605,8 +609,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
     std::vector<torch::Tensor> dMeansLocals(deviceCount);
     std::vector<torch::Tensor> dQuatsLocals(deviceCount);
     std::vector<torch::Tensor> dLogScalesLocals(deviceCount);
-    std::vector<torch::Tensor> dFeaturesLocals(deviceCount);
-    std::vector<torch::Tensor> dOpacitiesLocals(deviceCount);
+    CameraGradients cameraGradients({dFeatures, dOpacities}, tileExtentH * tileExtentW);
 
     std::vector<torch::Tensor> tileTensors = {
         renderedAlphas, lastIds, dLossDRenderedFeatures, dLossDRenderedAlphas};
@@ -628,8 +631,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         dMeansLocals[deviceId]     = makeLocalGradient(means, deviceId, currentStream);
         dQuatsLocals[deviceId]     = makeLocalGradient(quats, deviceId, currentStream);
         dLogScalesLocals[deviceId] = makeLocalGradient(logScales, deviceId, currentStream);
-        dFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, currentStream);
-        dOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, currentStream);
+        cameraGradients.prepare(deviceId, prefetchStreams[deviceId]);
 
         const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
         if (deviceTileCount > 0) {
@@ -656,9 +658,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
-        const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
-
-        if (deviceTileCount > 0) {
+        for (const auto &segment: cameraGradients.segments(deviceId)) {
             launchBackwardKernel<NUM_CHANNELS, Camera>(means,
                                                        quats,
                                                        logScales,
@@ -681,18 +681,18 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
                                                        dMeansLocals[deviceId],
                                                        dQuatsLocals[deviceId],
                                                        dLogScalesLocals[deviceId],
-                                                       dFeaturesLocals[deviceId],
-                                                       dOpacitiesLocals[deviceId],
-                                                       static_cast<uint32_t>(deviceTileOffset),
-                                                       static_cast<uint32_t>(deviceTileCount),
-                                                       stream);
+                                                       segment.gradients[0],
+                                                       segment.gradients[1],
+                                                       segment.tileOffset,
+                                                       segment.tileCount,
+                                                       stream,
+                                                       segment.cameraOffset);
         }
     }
 
-    // Rasterization writes to device-local buffers, allowing output prefetching to overlap.
+    // Geometry gradients use local buffers, allowing their output prefetching to overlap.
     // Reuse the input prefetch streams to preserve their waits and ordering.
-    const std::vector<torch::Tensor> outTensors = {
-        dMeans, dQuats, dLogScales, dFeatures, dOpacities};
+    const std::vector<torch::Tensor> outTensors = {dMeans, dQuats, dLogScales};
     std::vector<cudaEvent_t> outputPrefetchEvents(deviceCount);
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -718,8 +718,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
     reduceGradientShards(dMeansLocals);
     reduceGradientShards(dQuatsLocals);
     reduceGradientShards(dLogScalesLocals);
-    reduceGradientShards(dFeaturesLocals);
-    reduceGradientShards(dOpacitiesLocals);
+    cameraGradients.finalize();
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -730,15 +729,11 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
     copyGradientShards<float>(dMeansLocals, dMeans);
     copyGradientShards<float>(dQuatsLocals, dQuats);
     copyGradientShards<float>(dLogScalesLocals, dLogScales);
-    copyGradientShards<float>(dFeaturesLocals, dFeatures);
-    copyGradientShards<float>(dOpacitiesLocals, dOpacities);
 
     // Enqueue frees after the reductions and output copies, before merging the compute streams.
     dMeansLocals.clear();
     dQuatsLocals.clear();
     dLogScalesLocals.clear();
-    dFeaturesLocals.clear();
-    dOpacitiesLocals.clear();
 
     mergeStreams();
     return {dMeans, dQuats, dLogScales, dFeatures, dOpacities};
