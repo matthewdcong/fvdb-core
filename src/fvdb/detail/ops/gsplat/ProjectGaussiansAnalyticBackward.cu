@@ -457,7 +457,7 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
         std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
         std::vector<torch::Tensor> dLossDWorldToCamMatricesLocals(c10::cuda::device_count());
 
-        // Prepare gradients after prior work, then make the current streams wait for preparation.
+        // Overlap output prefetching and zeroing with local camera-gradient initialization.
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto currentStream        = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -471,6 +471,11 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
 
             int64_t elementOffset, elementCount;
             std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
+
+            if (worldToCamMatricesRequiresGrad) {
+                dLossDWorldToCamMatricesLocals[deviceId] =
+                    makeLocalGradient(dLossDWorldToCamMatrices, deviceId, currentStream);
+            }
 
             if (elementCount > 0) {
 #if (CUDART_VERSION < 13000)
@@ -568,11 +573,6 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
 
             int64_t deviceProblemOffset, deviceProblemSize;
             std::tie(deviceProblemOffset, deviceProblemSize) = deviceChunk(N, deviceId);
-
-            if (worldToCamMatricesRequiresGrad) {
-                dLossDWorldToCamMatricesLocals[deviceId] =
-                    makeLocalGradient(dLossDWorldToCamMatrices, deviceId, stream);
-            }
 
             if (deviceProblemSize > 0) {
                 const dim3 NUM_BLOCKS(GET_BLOCKS(deviceProblemSize, DEFAULT_BLOCK_DIM), C);

@@ -614,7 +614,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         tileTensors.emplace_back(contiguousMasks.value());
     }
 
-    // Prefetch inputs after prior work, then make the current streams wait for those inputs.
+    // Overlap input prefetching with local-gradient initialization on the compute streams.
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto currentStream        = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -624,6 +624,12 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, currentStream));
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
+
+        dMeansLocals[deviceId]     = makeLocalGradient(means, deviceId, currentStream);
+        dQuatsLocals[deviceId]     = makeLocalGradient(quats, deviceId, currentStream);
+        dLogScalesLocals[deviceId] = makeLocalGradient(logScales, deviceId, currentStream);
+        dFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, currentStream);
+        dOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, currentStream);
 
         const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
         if (deviceTileCount > 0) {
@@ -651,12 +657,6 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
         const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
-
-        dMeansLocals[deviceId]     = makeLocalGradient(means, deviceId, stream);
-        dQuatsLocals[deviceId]     = makeLocalGradient(quats, deviceId, stream);
-        dLogScalesLocals[deviceId] = makeLocalGradient(logScales, deviceId, stream);
-        dFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, stream);
-        dOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, stream);
 
         if (deviceTileCount > 0) {
             launchBackwardKernel<NUM_CHANNELS, Camera>(means,
