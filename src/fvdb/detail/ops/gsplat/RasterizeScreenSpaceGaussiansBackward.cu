@@ -10,6 +10,7 @@
 #include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
 #include <fvdb/detail/utils/cuda/WarpReduce.cuh>
+#include <fvdb/detail/utils/gsplat/CameraGradients.h>
 #include <fvdb/detail/utils/gsplat/Gaussian2D.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterize.cuh>
 
@@ -34,6 +35,7 @@ struct RasterizeBackwardArgs {
 
     constexpr static bool IS_CHUNKED = (NUM_CHANNELS != NUM_SHARED_CHANNELS);
     bool mAbsGrad;
+    uint32_t mOutputCameraOffset;
 
     // These are either a packed tensor accessor or a jagged tensor accessor, depending on the
     // mode (dense or sparse, respectively). In sparse mode, they have dimensions {C, [AP_i, X]},
@@ -78,7 +80,8 @@ struct RasterizeBackwardArgs {
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt) // [AP]
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt, // [AP]
+        const uint32_t outputCameraOffset = 0)
         : commonArgs(means2d,
                      conics,
                      opacities,
@@ -95,6 +98,7 @@ struct RasterizeBackwardArgs {
                      tilePixelCumsum,
                      pixelMap),
           mAbsGrad(outDLossDMeans2dAbs.has_value()),
+          mOutputCameraOffset(outputCameraOffset),
           mRenderedAlphas(initJaggedAccessor<ScalarType, 2>(renderedAlphas, "renderedAlphas")),
           mLastGaussianIds(initJaggedAccessor<int32_t, 1>(lastGaussianIds, "lastGaussianIds")),
           mDLossDRenderedFeatures(
@@ -148,20 +152,21 @@ struct RasterizeBackwardArgs {
             TORCH_CHECK_VALUE(totalGaussians == mOutDLossDOpacities.size(0),
                               "Bad size for outDLossDOpacities");
         } else {
+            const int64_t outputCameraCount = mOutDLossDMeans2d.size(0);
+            TORCH_CHECK_VALUE(mOutputCameraOffset + outputCameraCount <= commonArgs.mNumCameras,
+                              "Output camera range exceeds the input camera count");
             if (mAbsGrad) {
-                TORCH_CHECK_VALUE(commonArgs.mNumCameras == mOutDLossDMeans2dAbs.size(0),
+                TORCH_CHECK_VALUE(outputCameraCount == mOutDLossDMeans2dAbs.size(0),
                                   "Bad size for outDLossDMeans2dAbs");
                 TORCH_CHECK_VALUE(2 == mOutDLossDMeans2dAbs.size(CommonArgs::NUM_OUTER_DIMS),
                                   "Bad size for outDLossDMeans2dAbs");
             }
 
-            TORCH_CHECK_VALUE(commonArgs.mNumCameras == mOutDLossDMeans2d.size(0),
-                              "Bad size for outDLossDMeans2d");
-            TORCH_CHECK_VALUE(commonArgs.mNumCameras == mOutDLossDConics.size(0),
+            TORCH_CHECK_VALUE(outputCameraCount == mOutDLossDConics.size(0),
                               "Bad size for outDLossDConics");
-            TORCH_CHECK_VALUE(commonArgs.mNumCameras == mOutDLossDFeatures.size(0),
+            TORCH_CHECK_VALUE(outputCameraCount == mOutDLossDFeatures.size(0),
                               "Bad size for outDLossDFeatures");
-            TORCH_CHECK_VALUE(commonArgs.mNumCameras == mOutDLossDOpacities.size(0),
+            TORCH_CHECK_VALUE(outputCameraCount == mOutDLossDOpacities.size(0),
                               "Bad size for outDLossDOpacities");
             TORCH_CHECK_VALUE(commonArgs.mNumGaussiansPerCamera == mOutDLossDOpacities.size(1),
                               "Bad size for outDLossDOpacities");
@@ -289,7 +294,7 @@ struct RasterizeBackwardArgs {
         if constexpr (IS_PACKED) {
             return reinterpret_cast<T *>(accessor[g].data());
         } else {
-            auto cid = g / commonArgs.mNumGaussiansPerCamera;
+            auto cid = g / commonArgs.mNumGaussiansPerCamera - mOutputCameraOffset;
             auto gid = g % commonArgs.mNumGaussiansPerCamera;
             return reinterpret_cast<T *>(accessor[cid][gid].data());
         }
@@ -311,7 +316,7 @@ struct RasterizeBackwardArgs {
         if constexpr (IS_PACKED) {
             return reinterpret_cast<T *>(accessor.data()) + g;
         } else {
-            auto cid = g / commonArgs.mNumGaussiansPerCamera;
+            auto cid = g / commonArgs.mNumGaussiansPerCamera - mOutputCameraOffset;
             auto gid = g % commonArgs.mNumGaussiansPerCamera;
             return reinterpret_cast<T *>(accessor[cid].data()) + gid;
         }
@@ -1176,7 +1181,8 @@ callRasterizeBackwardPrivateUse1(
     TORCH_CHECK(tileSize > 0, "Tile size must be greater than 0");
 
     // Just return empty tensors if there are no gaussians, cameras, or intersections
-    if (means2d.numel() == 0 || tileGaussianIds.numel() == 0) {
+    if (means2d.numel() == 0 || tileGaussianIds.numel() == 0 ||
+        (!activeTiles.has_value() && renderWindow.pixelCountPerCamera() == 0)) {
         return std::make_tuple(absGrad ? torch::zeros_like(means2d) : torch::Tensor(),
                                torch::zeros_like(means2d),
                                torch::zeros_like(conics),
@@ -1184,8 +1190,8 @@ callRasterizeBackwardPrivateUse1(
                                torch::zeros_like(opacities));
     }
 
-    // These managed outputs are populated from contiguous, device-local gradient shards after the
-    // raster kernels complete. Keep them contiguous so each device can publish one flat range.
+    // Dense per-camera gradients can accumulate directly into their owned output slices.
+    // Packed and sparse inputs retain the full local-buffer reduction path.
     torch::Tensor outDLossDMeans2d   = torch::empty(means2d.sizes(), means2d.options());
     torch::Tensor outDLossDConics    = torch::empty(conics.sizes(), conics.options());
     torch::Tensor outDLossDFeatures  = torch::empty(features.sizes(), features.options());
@@ -1232,6 +1238,13 @@ callRasterizeBackwardPrivateUse1(
         outTensors.emplace_back(outDLossDMeans2dAbs);
     }
 
+    std::optional<CameraGradients> cameraGradients;
+    if constexpr (!IS_PACKED) {
+        if (!activeTiles.has_value()) {
+            cameraGradients.emplace(outTensors, tilesPerCamera);
+        }
+    }
+
     std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
     // Keep each device's current compute stream unchanged through allocation, rasterization,
     // reduction, and release: the owning tensors enqueue their frees on their allocation streams.
@@ -1252,13 +1265,17 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, currentStream));
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
 
-        outDLossDMeans2dLocals[deviceId]   = makeLocalGradient(means2d, deviceId, currentStream);
-        outDLossDConicsLocals[deviceId]    = makeLocalGradient(conics, deviceId, currentStream);
-        outDLossDFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, currentStream);
-        outDLossDOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, currentStream);
-        if (absGrad) {
-            outDLossDMeans2dAbsLocals[deviceId] =
-                makeLocalGradient(means2d, deviceId, currentStream);
+        if (cameraGradients.has_value()) {
+            cameraGradients->prepare(deviceId, prefetchStreams[deviceId]);
+        } else {
+            outDLossDMeans2dLocals[deviceId] = makeLocalGradient(means2d, deviceId, currentStream);
+            outDLossDConicsLocals[deviceId] = makeLocalGradient(conics, deviceId, currentStream);
+            outDLossDFeaturesLocals[deviceId] = makeLocalGradient(features, deviceId, currentStream);
+            outDLossDOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, currentStream);
+            if (absGrad) {
+                outDLossDMeans2dAbsLocals[deviceId] =
+                    makeLocalGradient(means2d, deviceId, currentStream);
+            }
         }
 
         uint32_t deviceTileOffset, deviceTileCount;
@@ -1288,10 +1305,10 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
-        uint32_t deviceTileOffset, deviceTileCount;
-        std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
-
-        if (deviceTileCount) {
+        auto launch = [&](uint32_t deviceTileOffset,
+                          uint32_t deviceTileCount,
+                          const std::vector<torch::Tensor> &gradients,
+                          uint32_t outputCameraOffset) {
             RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
                 means2d,
                 conics,
@@ -1308,15 +1325,16 @@ callRasterizeBackwardPrivateUse1(
                 reshapedLastGaussianIds,
                 reshapedDLossDRenderedFeatures,
                 reshapedDLossDRenderedAlphas,
-                outDLossDMeans2dLocals[deviceId],
-                outDLossDConicsLocals[deviceId],
-                outDLossDFeaturesLocals[deviceId],
-                outDLossDOpacitiesLocals[deviceId],
-                absGrad ? std::make_optional(outDLossDMeans2dAbsLocals[deviceId]) : std::nullopt,
+                gradients[0],
+                gradients[1],
+                gradients[2],
+                gradients[3],
+                absGrad ? std::make_optional(gradients[4]) : std::nullopt,
                 activeTiles,
                 tilePixelMask,
                 tilePixelCumsum,
-                pixelMap);
+                pixelMap,
+                outputCameraOffset);
 
             const size_t numChannels =
                 (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
@@ -1340,7 +1358,35 @@ callRasterizeBackwardPrivateUse1(
             rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>
                 <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
+        };
+
+        if (cameraGradients.has_value()) {
+            for (const auto &segment: cameraGradients->segments(deviceId)) {
+                launch(segment.tileOffset, segment.tileCount, segment.gradients, segment.cameraOffset);
+            }
+        } else {
+            const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
+            if (deviceTileCount > 0) {
+                launch(deviceTileOffset,
+                       deviceTileCount,
+                       {outDLossDMeans2dLocals[deviceId],
+                        outDLossDConicsLocals[deviceId],
+                        outDLossDFeaturesLocals[deviceId],
+                        outDLossDOpacitiesLocals[deviceId],
+                        outDLossDMeans2dAbsLocals[deviceId]},
+                       0);
+            }
         }
+    }
+
+    if (cameraGradients.has_value()) {
+        cameraGradients->finalize();
+        mergeStreams();
+        return std::make_tuple(outDLossDMeans2dAbs,
+                               outDLossDMeans2d,
+                               outDLossDConics,
+                               outDLossDFeatures,
+                               outDLossDOpacities);
     }
 
     // Rasterization writes to device-local buffers prior to the cross-device reduction so it
