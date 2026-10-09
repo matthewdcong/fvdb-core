@@ -1360,7 +1360,7 @@ callRasterizeBackwardPrivateUse1(
                 prefetchSizes.emplace_back(elementCount * sizeof(ScalarType));
             }
         }
-        memPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
+        memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
 
         // Output copies wait on these events after all reductions have been queued.
         C10_CUDA_CHECK(
@@ -1517,28 +1517,28 @@ dispatchRasterizeScreenSpaceGaussiansBwd<torch::kCUDA>(
     }
 
     switch (colorDim) {
-        CALL_BWD_CUDA(1)
-        CALL_BWD_CUDA(2)
+        // CALL_BWD_CUDA(1)
+        // CALL_BWD_CUDA(2)
         CALL_BWD_CUDA(3)
-        CALL_BWD_CUDA(4)
-        CALL_BWD_CUDA(5)
-        CALL_BWD_CUDA(8)
-        CALL_BWD_CUDA(9)
-        CALL_BWD_CUDA(16)
-        CALL_BWD_CUDA(17)
-        CALL_BWD_CUDA(32)
-        CALL_BWD_CUDA(33)
-        CALL_BWD_CUDA(47) // TODO, is this only here to support a gtest?
-        CALL_BWD_CUDA(64)
-        CALL_BWD_CUDA(65)
-        CALL_BWD_CUDA(128)
-        CALL_BWD_CUDA(129)
-        CALL_BWD_CUDA(192)
-        CALL_BWD_CUDA(193)
-        CALL_BWD_CUDA(256)
-        CALL_BWD_CUDA(257)
-        CALL_BWD_CUDA(512)
-        CALL_BWD_CUDA(513)
+        // CALL_BWD_CUDA(4)
+        // CALL_BWD_CUDA(5)
+        // CALL_BWD_CUDA(8)
+        // CALL_BWD_CUDA(9)
+        // CALL_BWD_CUDA(16)
+        // CALL_BWD_CUDA(17)
+        // CALL_BWD_CUDA(32)
+        // CALL_BWD_CUDA(33)
+        // CALL_BWD_CUDA(47) // TODO, is this only here to support a gtest?
+        // CALL_BWD_CUDA(64)
+        // CALL_BWD_CUDA(65)
+        // CALL_BWD_CUDA(128)
+        // CALL_BWD_CUDA(129)
+        // CALL_BWD_CUDA(192)
+        // CALL_BWD_CUDA(193)
+        // CALL_BWD_CUDA(256)
+        // CALL_BWD_CUDA(257)
+        // CALL_BWD_CUDA(512)
+        // CALL_BWD_CUDA(513)
     default: AT_ERROR("Unsupported number of channels: ", colorDim);
     }
 }
@@ -1605,28 +1605,28 @@ dispatchRasterizeScreenSpaceGaussiansBwd<torch::kPrivateUse1>(
     }
 
     switch (colorDim) {
-        CALL_BWD_PRIVATEUSE1(1)
-        CALL_BWD_PRIVATEUSE1(2)
+        // CALL_BWD_PRIVATEUSE1(1)
+        // CALL_BWD_PRIVATEUSE1(2)
         CALL_BWD_PRIVATEUSE1(3)
-        CALL_BWD_PRIVATEUSE1(4)
-        CALL_BWD_PRIVATEUSE1(5)
-        CALL_BWD_PRIVATEUSE1(8)
-        CALL_BWD_PRIVATEUSE1(9)
-        CALL_BWD_PRIVATEUSE1(16)
-        CALL_BWD_PRIVATEUSE1(17)
-        CALL_BWD_PRIVATEUSE1(32)
-        CALL_BWD_PRIVATEUSE1(33)
-        CALL_BWD_PRIVATEUSE1(47) // TODO, is this only here to support a gtest?
-        CALL_BWD_PRIVATEUSE1(64)
-        CALL_BWD_PRIVATEUSE1(65)
-        CALL_BWD_PRIVATEUSE1(128)
-        CALL_BWD_PRIVATEUSE1(129)
-        CALL_BWD_PRIVATEUSE1(192)
-        CALL_BWD_PRIVATEUSE1(193)
-        CALL_BWD_PRIVATEUSE1(256)
-        CALL_BWD_PRIVATEUSE1(257)
-        CALL_BWD_PRIVATEUSE1(512)
-        CALL_BWD_PRIVATEUSE1(513)
+        // CALL_BWD_PRIVATEUSE1(4)
+        // CALL_BWD_PRIVATEUSE1(5)
+        // CALL_BWD_PRIVATEUSE1(8)
+        // CALL_BWD_PRIVATEUSE1(9)
+        // CALL_BWD_PRIVATEUSE1(16)
+        // CALL_BWD_PRIVATEUSE1(17)
+        // CALL_BWD_PRIVATEUSE1(32)
+        // CALL_BWD_PRIVATEUSE1(33)
+        // CALL_BWD_PRIVATEUSE1(47) // TODO, is this only here to support a gtest?
+        // CALL_BWD_PRIVATEUSE1(64)
+        // CALL_BWD_PRIVATEUSE1(65)
+        // CALL_BWD_PRIVATEUSE1(128)
+        // CALL_BWD_PRIVATEUSE1(129)
+        // CALL_BWD_PRIVATEUSE1(192)
+        // CALL_BWD_PRIVATEUSE1(193)
+        // CALL_BWD_PRIVATEUSE1(256)
+        // CALL_BWD_PRIVATEUSE1(257)
+        // CALL_BWD_PRIVATEUSE1(512)
+        // CALL_BWD_PRIVATEUSE1(513)
     default: AT_ERROR("Unsupported number of channels: ", colorDim);
     }
 }
@@ -1730,28 +1730,28 @@ dispatchRasterizeScreenSpaceGaussiansSparseBwd<torch::kCUDA>(
     }
 
     switch (colorDim) {
-        CALL_BWD_SPARSE_CUDA(1)
-        CALL_BWD_SPARSE_CUDA(2)
+        // CALL_BWD_SPARSE_CUDA(1)
+        // CALL_BWD_SPARSE_CUDA(2)
         CALL_BWD_SPARSE_CUDA(3)
-        CALL_BWD_SPARSE_CUDA(4)
-        CALL_BWD_SPARSE_CUDA(5)
-        CALL_BWD_SPARSE_CUDA(8)
-        CALL_BWD_SPARSE_CUDA(9)
-        CALL_BWD_SPARSE_CUDA(16)
-        CALL_BWD_SPARSE_CUDA(17)
-        CALL_BWD_SPARSE_CUDA(32)
-        CALL_BWD_SPARSE_CUDA(33)
-        CALL_BWD_SPARSE_CUDA(47)
-        CALL_BWD_SPARSE_CUDA(64)
-        CALL_BWD_SPARSE_CUDA(65)
-        CALL_BWD_SPARSE_CUDA(128)
-        CALL_BWD_SPARSE_CUDA(129)
-        CALL_BWD_SPARSE_CUDA(192)
-        CALL_BWD_SPARSE_CUDA(193)
-        CALL_BWD_SPARSE_CUDA(256)
-        CALL_BWD_SPARSE_CUDA(257)
-        CALL_BWD_SPARSE_CUDA(512)
-        CALL_BWD_SPARSE_CUDA(513)
+        // CALL_BWD_SPARSE_CUDA(4)
+        // CALL_BWD_SPARSE_CUDA(5)
+        // CALL_BWD_SPARSE_CUDA(8)
+        // CALL_BWD_SPARSE_CUDA(9)
+        // CALL_BWD_SPARSE_CUDA(16)
+        // CALL_BWD_SPARSE_CUDA(17)
+        // CALL_BWD_SPARSE_CUDA(32)
+        // CALL_BWD_SPARSE_CUDA(33)
+        // CALL_BWD_SPARSE_CUDA(47)
+        // CALL_BWD_SPARSE_CUDA(64)
+        // CALL_BWD_SPARSE_CUDA(65)
+        // CALL_BWD_SPARSE_CUDA(128)
+        // CALL_BWD_SPARSE_CUDA(129)
+        // CALL_BWD_SPARSE_CUDA(192)
+        // CALL_BWD_SPARSE_CUDA(193)
+        // CALL_BWD_SPARSE_CUDA(256)
+        // CALL_BWD_SPARSE_CUDA(257)
+        // CALL_BWD_SPARSE_CUDA(512)
+        // CALL_BWD_SPARSE_CUDA(513)
     default: AT_ERROR("Unsupported number of channels: ", colorDim);
     }
 }
