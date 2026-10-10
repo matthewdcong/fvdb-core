@@ -1321,7 +1321,7 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
 
         if (cameraGradients.has_value()) {
-            cameraGradients->prepare(deviceId, prefetchStreams[deviceId]);
+            cameraGradients->prepare(deviceId);
         } else {
             outDLossDMeans2dLocals[deviceId]   = makeLocalGradient(means2d, deviceId, stream);
             outDLossDConicsLocals[deviceId]    = makeLocalGradient(conics, deviceId, stream);
@@ -1352,6 +1352,11 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStreams[deviceId]));
         C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
         C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
+
+        // Prefetch outputs after input readiness so shared-camera rasterization can overlap it.
+        if (cameraGradients.has_value()) {
+            cameraGradients->prefetchOutputs(deviceId, prefetchStreams[deviceId]);
+        }
     }
 
     // Launch rasterization on every device before queuing reductions.
@@ -1414,6 +1419,7 @@ callRasterizeBackwardPrivateUse1(
 
         if (cameraGradients.has_value()) {
             for (const auto &segment: cameraGradients->segments(deviceId)) {
+                cameraGradients->prepareForRasterization(deviceId, segment);
                 launch(segment.tileOffset,
                        segment.tileCount,
                        ScreenSpaceGradients::fromTensors(segment.gradients));

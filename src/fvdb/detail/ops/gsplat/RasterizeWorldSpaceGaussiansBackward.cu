@@ -647,7 +647,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         dMeansLocals[deviceId]     = makeLocalGradient(means, deviceId, stream);
         dQuatsLocals[deviceId]     = makeLocalGradient(quats, deviceId, stream);
         dLogScalesLocals[deviceId] = makeLocalGradient(logScales, deviceId, stream);
-        cameraGradients.prepare(deviceId, prefetchStreams[deviceId]);
+        cameraGradients.prepare(deviceId);
 
         int64_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
@@ -668,6 +668,9 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStreams[deviceId]));
         C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
         C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
+
+        // Prefetch outputs after input readiness so shared-camera rasterization can overlap it.
+        cameraGradients.prefetchOutputs(deviceId, prefetchStreams[deviceId]);
     }
 
     // Launch rasterization on every device before queuing reductions.
@@ -676,6 +679,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
         for (const auto &segment: cameraGradients.segments(deviceId)) {
+            cameraGradients.prepareForRasterization(deviceId, segment);
             const auto gradients = WorldSpaceCameraGradients::fromTensors(segment.gradients);
             launchBackwardKernel<NUM_CHANNELS, Camera>(means,
                                                        quats,
