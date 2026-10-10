@@ -37,6 +37,10 @@ struct RasterizeForwardArgs {
 
     constexpr static bool IS_CHUNKED = (NUM_CHANNELS != NUM_SHARED_CHANNELS);
 
+    // Preserve full unrolling for small feature vectors while bounding compiler work for the
+    // 512/513-channel kernels, as in the world-space rasterizer.
+    enum : uint32_t { CHANNEL_UNROLL = NUM_CHANNELS <= 32 ? NUM_CHANNELS : 4 };
+
     JaggedRAcc64<ScalarType, 2> mOutFeatures; // [[nPixels, NUM_CHANNELS]_0..._C]
     JaggedRAcc64<ScalarType, 2> mOutAlphas;   // [[nPixels, 1]_0..._C]
     JaggedRAcc64<int32_t, 1> mOutLastIds;     // [[nPixels]_0..._C]
@@ -113,7 +117,7 @@ struct RasterizeForwardArgs {
             }
         } else {
             assert(channelStart == 0 && numChannels == NUM_CHANNELS);
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
             for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                 mOutFeatures.data()[pixelIndex][k] = f(k);
             }
@@ -143,7 +147,7 @@ struct RasterizeForwardArgs {
                     outFeatures[k] = featureAccessor[k + channelStart];
                 }
             } else {
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
                 for (auto k = 0; k < NUM_CHANNELS; ++k) {
                     outFeatures[k] = featureAccessor[k];
                 }
@@ -276,7 +280,7 @@ struct RasterizeForwardArgs {
                                     sharedGaussianFeatures[t * NUM_SHARED_CHANNELS + k] * vis;
                             }
                         } else {
-#pragma unroll
+#pragma unroll CHANNEL_UNROLL
                             for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                                 pixOut[k] +=
                                     sharedGaussianFeatures[t * NUM_SHARED_CHANNELS + k] * vis;

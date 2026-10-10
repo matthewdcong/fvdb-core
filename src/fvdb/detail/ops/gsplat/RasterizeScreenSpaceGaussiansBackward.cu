@@ -33,6 +33,15 @@ struct RasterizeBackwardArgs {
     using ScalarAccessor = typename CommonArgs::ScalarAccessor;
 
     constexpr static bool IS_CHUNKED = (NUM_CHANNELS != NUM_SHARED_CHANNELS);
+
+    // Preserve full unrolling for small feature vectors while bounding compiler work for the
+    // 512/513-channel kernels, as in the world-space rasterizer.
+    enum : size_t {
+        CHANNEL_UNROLL = NUM_CHANNELS <= 32 ? NUM_CHANNELS : 4,
+        SHARED_CHANNEL_UNROLL =
+            NUM_CHANNELS <= 32 || NUM_SHARED_CHANNELS <= 32 ? NUM_SHARED_CHANNELS : 4
+    };
+
     bool mAbsGrad;
 
     // These are either a packed tensor accessor or a jagged tensor accessor, depending on the
@@ -263,7 +272,7 @@ struct RasterizeBackwardArgs {
                     outFeatures[k] = featureAccessor[k + channelStart];
                 }
             } else {
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
                 for (auto k = 0; k < NUM_CHANNELS; ++k) {
                     outFeatures[k] = featureAccessor[k];
                 }
@@ -332,7 +341,7 @@ struct RasterizeBackwardArgs {
                           featureGradientContribution[k]);
             }
         } else {
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
             for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                 atomicAdd(dLossDFeaturesGaussianPtr + k, featureGradientContribution[k]);
             }
@@ -388,7 +397,7 @@ struct RasterizeBackwardArgs {
                 outAccumFeatures[k] += gaussianFeatures[k] * fac;
             }
         } else {
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
             for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                 outAccumFeatures[k] += gaussianFeatures[k] * fac;
             }
@@ -405,7 +414,7 @@ struct RasterizeBackwardArgs {
     calculateFeatureGradientContribution(const ScalarType fac,
                                          const ScalarType *dLossDRenderedFeatures,
                                          ScalarType *outFeatureGradientContribution) const {
-#pragma unroll NUM_SHARED_CHANNELS
+#pragma unroll SHARED_CHANNEL_UNROLL
         for (uint32_t k = 0; k < NUM_SHARED_CHANNELS; ++k) {
             outFeatureGradientContribution[k] = fac * dLossDRenderedFeatures[k];
         }
@@ -436,7 +445,7 @@ struct RasterizeBackwardArgs {
                                              dLossDRenderedFeature[k];
             }
         } else {
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
             for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                 alphaGradientContribution += (gaussianFeature[k] * accumTransmittance -
                                               accumFeature[k] * oneOverOneMinusAlpha) *
@@ -457,7 +466,7 @@ struct RasterizeBackwardArgs {
                     accum += commonArgs.mBackgrounds[cameraId][k] * dLossDRenderedFeature[k];
                 }
             } else {
-#pragma unroll NUM_CHANNELS
+#pragma unroll CHANNEL_UNROLL
                 for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                     accum += commonArgs.mBackgrounds[cameraId][k] * dLossDRenderedFeature[k];
                 }
@@ -781,7 +790,7 @@ struct RasterizeBackwardArgs {
 
                     // Accumulate the gradient contribution to this Gaussian from every
                     // pixel in the block
-                    if constexpr (IS_CHUNKED) {
+                    if constexpr (IS_CHUNKED || NUM_SHARED_CHANNELS > 32) {
                         warpSumMut<decltype(warp), ScalarType>(
                             featureGradientContribution, numChannels, warp);
                     } else {
