@@ -44,7 +44,6 @@ struct RasterizeBackwardArgs {
     };
 
     bool mAbsGrad;
-    uint32_t mOutputCameraOffset;
 
     // These are either a packed tensor accessor or a jagged tensor accessor, depending on the
     // mode (dense or sparse, respectively). In sparse mode, they have dimensions {C, [AP_i, X]},
@@ -89,8 +88,7 @@ struct RasterizeBackwardArgs {
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt, // [AP]
-        const uint32_t outputCameraOffset = 0)
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt)        // [AP]
         : commonArgs(means2d,
                      conics,
                      opacities,
@@ -107,7 +105,6 @@ struct RasterizeBackwardArgs {
                      tilePixelCumsum,
                      pixelMap),
           mAbsGrad(outDLossDMeans2dAbs.has_value()),
-          mOutputCameraOffset(outputCameraOffset),
           mRenderedAlphas(initJaggedAccessor<ScalarType, 2>(renderedAlphas, "renderedAlphas")),
           mLastGaussianIds(initJaggedAccessor<int32_t, 1>(lastGaussianIds, "lastGaussianIds")),
           mDLossDRenderedFeatures(
@@ -125,6 +122,20 @@ struct RasterizeBackwardArgs {
           mOutDLossDOpacities(initAccessor<ScalarType, CommonArgs::NUM_OUTER_DIMS>(
               outDLossDOpacities, "outDLossDOpacities")) {
         checkInputShapes();
+    }
+
+    // Dense output slices start at the camera containing the launch's first tile. Packed and
+    // sparse launches keep full gradient buffers, so their output indices have no camera offset.
+    inline __host__ __device__ uint32_t
+    outputCameraOffset() const {
+        if constexpr (IS_PACKED) {
+            return 0;
+        } else {
+            const uint32_t tilesPerCamera = commonArgs.mNumTilesH * commonArgs.mNumTilesW;
+            return commonArgs.mIsSparse || tilesPerCamera == 0
+                       ? 0
+                       : commonArgs.mBlockOffset / tilesPerCamera;
+        }
     }
 
     // Check that the input tensor shapes are valid
@@ -162,7 +173,7 @@ struct RasterizeBackwardArgs {
                               "Bad size for outDLossDOpacities");
         } else {
             const int64_t outputCameraCount = mOutDLossDMeans2d.size(0);
-            TORCH_CHECK_VALUE(mOutputCameraOffset + outputCameraCount <= commonArgs.mNumCameras,
+            TORCH_CHECK_VALUE(outputCameraOffset() + outputCameraCount <= commonArgs.mNumCameras,
                               "Output camera range exceeds the input camera count");
             if (mAbsGrad) {
                 TORCH_CHECK_VALUE(outputCameraCount == mOutDLossDMeans2dAbs.size(0),
@@ -295,7 +306,7 @@ struct RasterizeBackwardArgs {
     /// @tparam T The type of the data to access
     /// @tparam Accessor The type of the accessor
     /// @param accessor The accessor to the tensor
-    /// @param g The index of the Gaussian
+    /// @param g The index of the Gaussian relative to the gradient output tensors
     /// @return A pointer to the data for the Gaussian
     template <typename T, typename Accessor>
     inline __device__ T *
@@ -303,7 +314,7 @@ struct RasterizeBackwardArgs {
         if constexpr (IS_PACKED) {
             return reinterpret_cast<T *>(accessor[g].data());
         } else {
-            auto cid = g / commonArgs.mNumGaussiansPerCamera - mOutputCameraOffset;
+            auto cid = g / commonArgs.mNumGaussiansPerCamera;
             auto gid = g % commonArgs.mNumGaussiansPerCamera;
             return reinterpret_cast<T *>(accessor[cid][gid].data());
         }
@@ -314,7 +325,7 @@ struct RasterizeBackwardArgs {
     /// @tparam T The type of the data to access
     /// @tparam Accessor The type of the accessor
     /// @param accessor The accessor to the tensor
-    /// @param g The index of the Gaussian
+    /// @param g The index of the Gaussian relative to the gradient output tensors
     /// @return A pointer to the data for the Gaussian
     template <typename T, typename Accessor>
     inline __device__ T *
@@ -325,7 +336,7 @@ struct RasterizeBackwardArgs {
         if constexpr (IS_PACKED) {
             return reinterpret_cast<T *>(accessor.data()) + g;
         } else {
-            auto cid = g / commonArgs.mNumGaussiansPerCamera - mOutputCameraOffset;
+            auto cid = g / commonArgs.mNumGaussiansPerCamera;
             auto gid = g % commonArgs.mNumGaussiansPerCamera;
             return reinterpret_cast<T *>(accessor[cid].data()) + gid;
         }
@@ -333,7 +344,7 @@ struct RasterizeBackwardArgs {
 
     /// @brief Atomically accumulate the gradient contribution from this pixel to the gradient of
     /// the loss with respect to the features of this Gaussian
-    /// @param g The index of the Gaussian
+    /// @param g The index of the Gaussian relative to the gradient output tensors
     /// @param featureGradientContribution The gradient contribution from this pixel to the gradient
     /// for the features of this Gaussian
     /// @param channelStart The starting channel index for the features
@@ -359,7 +370,7 @@ struct RasterizeBackwardArgs {
 
     /// @brief Atomically accumulate the gradient contribution from this pixel to the gradient of
     /// the loss with respect to the means, conics, and opacities of this Gaussian
-    /// @param g The index of the Gaussian
+    /// @param g The index of the Gaussian relative to the gradient output tensors
     /// @param pixelConicGradientContribution The gradient contribution from this pixel to the
     /// gradient of the loss with respect to the conic of this Gaussian
     /// @param pixelMean2dGradientContribution The gradient contribution from this pixel to the
@@ -628,6 +639,9 @@ struct RasterizeBackwardArgs {
                              const uint32_t blockSize,
                              const bool pixelIsActive,
                              const uint32_t activePixelIndex) {
+        // Derive the output base once, before the Gaussian loops. Input IDs remain global.
+        const uint32_t outputGaussianOffset =
+            outputCameraOffset() * commonArgs.mNumGaussiansPerCamera;
         alignas(Gaussian2D<ScalarType>) extern __shared__ char s[];
 
         Gaussian2D<ScalarType> *sharedGaussians =
@@ -814,12 +828,14 @@ struct RasterizeBackwardArgs {
                     // contribution from the whole block into the global gradient of
                     // this Gaussian
                     if (warp.thread_rank() == 0) {
-                        atomicAddFeatureGradientContributions(sharedGaussians[t].id,
+                        const int32_t outputGaussianId =
+                            sharedGaussians[t].id - outputGaussianOffset;
+                        atomicAddFeatureGradientContributions(outputGaussianId,
                                                               featureGradientContribution,
                                                               channelStart,
                                                               numChannels);
                         atomicAddMeans2dConicsAndOpacitiesGradientContributions(
-                            sharedGaussians[t].id,
+                            outputGaussianId,
                             conicGradientContribution,
                             mean2dGradientContribution,
                             mean2dAbsGradientContribution,
@@ -1164,6 +1180,33 @@ callRasterizeBackwardWithCorrectSharedChannels(
     }
 }
 
+struct ScreenSpaceGradients {
+    const torch::Tensor &means2d;
+    const torch::Tensor &conics;
+    const torch::Tensor &features;
+    const torch::Tensor &opacities;
+    std::optional<torch::Tensor> means2dAbs;
+
+    static ScreenSpaceGradients
+    fromTensors(const std::vector<torch::Tensor> &gradients) {
+        TORCH_INTERNAL_ASSERT(gradients.size() == 4 || gradients.size() == 5);
+        return {gradients[0],
+                gradients[1],
+                gradients[2],
+                gradients[3],
+                gradients.size() == 5 ? std::make_optional(gradients[4]) : std::nullopt};
+    }
+
+    std::vector<torch::Tensor>
+    tensors() const {
+        std::vector<torch::Tensor> gradients = {means2d, conics, features, opacities};
+        if (means2dAbs.has_value()) {
+            gradients.push_back(means2dAbs.value());
+        }
+        return gradients;
+    }
+};
+
 template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 callRasterizeBackwardPrivateUse1(
@@ -1242,11 +1285,13 @@ callRasterizeBackwardPrivateUse1(
     std::vector<torch::Tensor> tileTensors = {dLossDRenderedFeatures.jdata(),
                                               dLossDRenderedAlphas.jdata()};
 
-    std::vector<torch::Tensor> outTensors = {
-        outDLossDMeans2d, outDLossDConics, outDLossDFeatures, outDLossDOpacities};
-    if (absGrad) {
-        outTensors.emplace_back(outDLossDMeans2dAbs);
-    }
+    const ScreenSpaceGradients outputs{outDLossDMeans2d,
+                                       outDLossDConics,
+                                       outDLossDFeatures,
+                                       outDLossDOpacities,
+                                       absGrad ? std::make_optional(outDLossDMeans2dAbs)
+                                               : std::nullopt};
+    const auto outTensors = outputs.tensors();
 
     std::optional<CameraGradients> cameraGradients;
     if constexpr (!IS_PACKED) {
@@ -1309,15 +1354,14 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
     }
 
-    // Launch rasterization on every device before submitting output prefetches.
+    // Launch rasterization on every device before queuing reductions.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
         auto launch = [&](uint32_t deviceTileOffset,
                           uint32_t deviceTileCount,
-                          const std::vector<torch::Tensor> &gradients,
-                          uint32_t outputCameraOffset) {
+                          const ScreenSpaceGradients &gradients) {
             RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
                 means2d,
                 conics,
@@ -1334,16 +1378,15 @@ callRasterizeBackwardPrivateUse1(
                 reshapedLastGaussianIds,
                 reshapedDLossDRenderedFeatures,
                 reshapedDLossDRenderedAlphas,
-                gradients[0],
-                gradients[1],
-                gradients[2],
-                gradients[3],
-                absGrad ? std::make_optional(gradients[4]) : std::nullopt,
+                gradients.means2d,
+                gradients.conics,
+                gradients.features,
+                gradients.opacities,
+                gradients.means2dAbs,
                 activeTiles,
                 tilePixelMask,
                 tilePixelCumsum,
-                pixelMap,
-                outputCameraOffset);
+                pixelMap);
 
             const size_t numChannels =
                 (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
@@ -1371,7 +1414,9 @@ callRasterizeBackwardPrivateUse1(
 
         if (cameraGradients.has_value()) {
             for (const auto &segment: cameraGradients->segments(deviceId)) {
-                launch(segment.tileOffset, segment.tileCount, segment.gradients, segment.cameraOffset);
+                launch(segment.tileOffset,
+                       segment.tileCount,
+                       ScreenSpaceGradients::fromTensors(segment.gradients));
             }
         } else {
             const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
@@ -1382,8 +1427,8 @@ callRasterizeBackwardPrivateUse1(
                         outDLossDConicsLocals[deviceId],
                         outDLossDFeaturesLocals[deviceId],
                         outDLossDOpacitiesLocals[deviceId],
-                        outDLossDMeans2dAbsLocals[deviceId]},
-                       0);
+                        absGrad ? std::make_optional(outDLossDMeans2dAbsLocals[deviceId])
+                                : std::nullopt});
             }
         }
     }
@@ -1438,12 +1483,12 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    copyGradientShards<ScalarType>(outDLossDMeans2dLocals, outDLossDMeans2d);
-    copyGradientShards<ScalarType>(outDLossDConicsLocals, outDLossDConics);
-    copyGradientShards<ScalarType>(outDLossDFeaturesLocals, outDLossDFeatures);
-    copyGradientShards<ScalarType>(outDLossDOpacitiesLocals, outDLossDOpacities);
+    copyGradientShards(outDLossDMeans2dLocals, outDLossDMeans2d);
+    copyGradientShards(outDLossDConicsLocals, outDLossDConics);
+    copyGradientShards(outDLossDFeaturesLocals, outDLossDFeatures);
+    copyGradientShards(outDLossDOpacitiesLocals, outDLossDOpacities);
     if (absGrad) {
-        copyGradientShards<ScalarType>(outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs);
+        copyGradientShards(outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs);
     }
 
     // Enqueue frees after the reductions and output copies, before merging the compute streams.
