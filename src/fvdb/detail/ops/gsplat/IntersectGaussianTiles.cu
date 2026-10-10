@@ -6,9 +6,8 @@
 #include <fvdb/detail/utils/Nvtx.h>
 #include <fvdb/detail/utils/Utils.h>
 #include <fvdb/detail/utils/cuda/GridDim.h>
+#include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
-
-#include <nanovdb/util/cuda/Util.h>
 
 #include <c10/cuda/CUDAGuard.h>
 
@@ -1337,7 +1336,6 @@ intersectGaussianTilesPrivateUse1Impl(
     const auto opacitiesPtr =
         opacities.has_value() ? opacities.value().const_data_ptr<scalar_t>() : nullptr;
 
-    const int deviceCount       = static_cast<int>(c10::cuda::device_count());
     const int64_t totalTileKeys = static_cast<int64_t>(numCameras) * totalTiles;
 
     // Give each device a contiguous range of the tile-key space [0, numCameras * totalTiles). The
@@ -1351,9 +1349,9 @@ intersectGaussianTilesPrivateUse1Impl(
     // [deviceCount, totalGaussians] tensor, which the multi-GPU allocator would stripe) so its row
     // stays device-local; count and scan share the per-device stream, so no merge is needed, and a
     // single-device CUB scan avoids torch::cumsum dispatching to the multi-GPU cumsum.
-    std::vector<int64_t *> deviceTilesPerGaussianCumsum(deviceCount, nullptr);
+    std::vector<int64_t *> deviceTilesPerGaussianCumsum(c10::cuda::device_count(), nullptr);
 
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
@@ -1407,12 +1405,12 @@ intersectGaussianTilesPrivateUse1Impl(
     // safe; an explicit per-device synchronize is required.
     // deviceIntersectionOffset[d] is the start offset of device d's intersections in the
     // concatenated (globally sorted) output, and deviceIntersectionCount[d] is the number it owns.
-    std::vector<int64_t> deviceIntersectionOffset(deviceCount);
-    std::vector<int64_t> deviceIntersectionCount(deviceCount);
+    std::vector<int64_t> deviceIntersectionOffset(c10::cuda::device_count());
+    std::vector<int64_t> deviceIntersectionCount(c10::cuda::device_count());
     int64_t totalIntersections = 0;
     int64_t *deviceTotals      = nullptr;
-    C10_CUDA_CHECK(cudaMallocHost(&deviceTotals, deviceCount * sizeof(int64_t)));
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    C10_CUDA_CHECK(cudaMallocHost(&deviceTotals, c10::cuda::device_count() * sizeof(int64_t)));
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
         // The total is the last element of the device's inclusive-scan row. Issuing the copy on the
@@ -1424,7 +1422,7 @@ intersectGaussianTilesPrivateUse1Impl(
                                        cudaMemcpyDeviceToHost,
                                        stream));
     }
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
         C10_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1435,7 +1433,7 @@ intersectGaussianTilesPrivateUse1Impl(
     C10_CUDA_CHECK(cudaFreeHost(deviceTotals));
 
     if (totalIntersections == 0) {
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
             C10_CUDA_CHECK(cudaFreeAsync(deviceTilesPerGaussianCumsum[deviceId], stream));
@@ -1445,7 +1443,7 @@ intersectGaussianTilesPrivateUse1Impl(
     } else {
         // Keys are temporary and each device only reads or writes its own independently sorted
         // range. Keep them in stream-ordered device-local allocations instead of a managed tensor.
-        std::vector<int64_t *> deviceIntersectionKeys(deviceCount, nullptr);
+        std::vector<int64_t *> deviceIntersectionKeys(c10::cuda::device_count(), nullptr);
         torch::Tensor intersectionValues =
             torch::empty({totalIntersections}, means2d.options().dtype(torch::kInt32));
 
@@ -1462,7 +1460,7 @@ intersectGaussianTilesPrivateUse1Impl(
         // the Unified Memory pool allocator which leads to spurious OOM errors.
 
         // TODO: Explore the use of a memory resource model to avoid the raw allocation.
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
             if (deviceIntersectionCount[deviceId] > 0) {
@@ -1472,10 +1470,10 @@ intersectGaussianTilesPrivateUse1Impl(
             }
         }
 
-        // intersectionValues is returned as a managed tensor, so prefetch each device's slice
-        // [intersectionOffset, intersectionOffset + intersectionCount) before the emit and sort.
+        // Both managed outputs are fully overwritten: emit fills the intersection IDs and
+        // computeTileOffsets fills every owned tile, including tiles with no intersections.
         // The temporary keys are already device-local and require no prefetch.
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
@@ -1483,19 +1481,38 @@ intersectGaussianTilesPrivateUse1Impl(
             const int64_t intersectionCount  = deviceIntersectionCount[deviceId];
             if (intersectionCount > 0) {
                 sleepKernel<<<1, 1, 0, stream>>>();
-                C10_CUDA_CHECK(nanovdb::util::cuda::memPrefetchAsync(
-                    intersectionValues.data_ptr<int32_t>() + intersectionOffset,
-                    intersectionCount * sizeof(int32_t),
-                    deviceId,
-                    stream));
             }
+
+            cudaEvent_t prefetchEvent;
+            C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
+            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
+            auto prefetchStream = c10::cuda::getStreamFromPool(false, deviceId);
+            C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStream, prefetchEvent));
+
+            std::vector<void *> prefetchPointers;
+            std::vector<size_t> prefetchSizes;
+            if (intersectionCount > 0) {
+                prefetchPointers.emplace_back(intersectionValues.data_ptr<int32_t>() +
+                                              intersectionOffset);
+                prefetchSizes.emplace_back(intersectionCount * sizeof(int32_t));
+            }
+            size_t deviceKeyOffset, deviceKeyCount;
+            std::tie(deviceKeyOffset, deviceKeyCount) = deviceChunk(totalTileKeys, deviceId);
+            if (deviceKeyCount > 0) {
+                prefetchPointers.emplace_back(tileJOffsets.data_ptr<int64_t>() + deviceKeyOffset);
+                prefetchSizes.emplace_back(deviceKeyCount * sizeof(int64_t));
+            }
+            memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
+            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
+            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
+            C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
         }
 
         // Compute the intersections owned by each device. Each device scans all Gaussians and
         // writes only the intersections whose tile-key falls in its range, into its own contiguous
         // slice [intersectionOffset, intersectionOffset + intersectionCount) of the global
         // intersection arrays.
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
@@ -1549,7 +1566,7 @@ intersectGaussianTilesPrivateUse1Impl(
         // own slice. Because the tile-key ranges are disjoint and ordered, the concatenation of the
         // sorted slices is globally sorted, so no cross-device merge is needed. Sorting follows
         // emit on the same stream without a global barrier.
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
@@ -1605,7 +1622,7 @@ intersectGaussianTilesPrivateUse1Impl(
         // Compute offsets from each device's local sorted keys. Each device fills only its disjoint
         // tile-key range, including empty tiles, so no cross-device key reads or merge barrier are
         // needed. Free the temporary keys on the same stream after their final use.
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
