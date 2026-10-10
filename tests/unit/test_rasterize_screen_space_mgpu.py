@@ -120,8 +120,11 @@ def test_camera_cooperation_with_empty_work(gaussian_count, width, height, empty
     _assert_parity(scene)
 
 
-def test_camera_cooperation_on_nondefault_streams():
+@pytest.mark.parametrize("camera_count", [1, 3, 6])
+def test_camera_cooperation_on_nondefault_streams(camera_count):
     with ExitStack() as stack:
         for device in range(torch.cuda.device_count()):
             stack.enter_context(torch.cuda.stream(torch.cuda.Stream(device=device)))
-        _assert_parity(_scene(4))
+        scene = _scene(camera_count)
+        scene["masks"] = None  # Shared cameras must contribute on every participating device.
+        _assert_parity(scene)

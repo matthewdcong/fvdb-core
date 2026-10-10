@@ -674,7 +674,7 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
                     C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
                 }
             }
-            copyGradientShards<float>(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
+            copyGradientShards(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
 
             // Enqueue frees after reduction and output copies, before merging the compute streams.
             dLossDWorldToCamMatricesLocals.clear();

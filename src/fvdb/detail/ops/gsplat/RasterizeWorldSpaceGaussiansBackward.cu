@@ -43,7 +43,6 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldBackw
     RasterizeFromWorldCommonArgs commonArgs;
     Camera camera;
     uint32_t blockOffset;
-    uint32_t outputCameraOffset;
     // Forward outputs
     fvdb::TorchRAcc64<float, 4> renderedAlphas; // [C,H,W,1]
     fvdb::TorchRAcc64<int32_t, 3> lastIds;      // [C,H,W]
@@ -70,6 +69,9 @@ rasterizeFromWorld3DGSBackwardKernel(
     auto block               = cg::this_thread_block();
     const uint32_t blockSize = blockDim.x * blockDim.y;
     const auto &common       = args.commonArgs;
+
+    // The output slice starts at the camera containing this launch's first tile.
+    const uint32_t outputCameraOffset = args.blockOffset / (common.numTilesH * common.numTilesW);
 
     uint32_t camId, tileRow, tileCol, row, col;
     common.denseCoordinates(camId, tileRow, tileCol, row, col, args.blockOffset);
@@ -356,8 +358,7 @@ rasterizeFromWorld3DGSBackwardKernel(
 
             if (warp.thread_rank() == 0) {
                 const int32_t flatId = idBatch[t];
-                const int32_t cid    = flatId / (int32_t)common.means.size(0) -
-                                       args.outputCameraOffset;
+                const int32_t cid    = flatId / (int32_t)common.means.size(0) - outputCameraOffset;
                 const int32_t gid    = flatId % (int32_t)common.means.size(0);
 
                 // Per-camera grads
@@ -422,8 +423,7 @@ launchBackwardKernel(const torch::Tensor &means,
                      const torch::Tensor &dOpacities,
                      const uint32_t blockOffset,
                      const uint32_t blockCount,
-                     const cudaStream_t stream,
-                     const uint32_t outputCameraOffset = 0) {
+                     const cudaStream_t stream) {
     const int64_t C = features.size(0);
 
     const uint32_t tileExtentW = (imageWidth + tileSize - 1) / tileSize;
@@ -467,7 +467,6 @@ launchBackwardKernel(const torch::Tensor &means,
         args,
         camera,
         blockOffset,
-        outputCameraOffset,
         renderedAlphas.packed_accessor64<float, 4, torch::RestrictPtrTraits>(),
         lastIds.packed_accessor64<int32_t, 3, torch::RestrictPtrTraits>(),
         dLossDRenderedFeatures.packed_accessor64<float, 4, torch::RestrictPtrTraits>(),
@@ -554,6 +553,22 @@ launchBackwardCUDA(const torch::Tensor &means,
     return {dMeans, dQuats, dLogScales, dFeatures, dOpacities};
 }
 
+struct WorldSpaceCameraGradients {
+    const torch::Tensor &features;
+    const torch::Tensor &opacities;
+
+    static WorldSpaceCameraGradients
+    fromTensors(const std::vector<torch::Tensor> &gradients) {
+        TORCH_INTERNAL_ASSERT(gradients.size() == 2);
+        return {gradients[0], gradients[1]};
+    }
+
+    std::vector<torch::Tensor>
+    tensors() const {
+        return {features, opacities};
+    }
+};
+
 template <uint32_t NUM_CHANNELS, typename Camera>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 launchBackwardPrivateUse1(const torch::Tensor &means,
@@ -609,7 +624,8 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
     std::vector<torch::Tensor> dMeansLocals(deviceCount);
     std::vector<torch::Tensor> dQuatsLocals(deviceCount);
     std::vector<torch::Tensor> dLogScalesLocals(deviceCount);
-    CameraGradients cameraGradients({dFeatures, dOpacities}, tileExtentH * tileExtentW);
+    const WorldSpaceCameraGradients outputs{dFeatures, dOpacities};
+    CameraGradients cameraGradients(outputs.tensors(), tileExtentH * tileExtentW);
 
     std::vector<torch::Tensor> tileTensors = {
         renderedAlphas, lastIds, dLossDRenderedFeatures, dLossDRenderedAlphas};
@@ -653,12 +669,13 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
     }
 
-    // Launch rasterization on every device before submitting output prefetches.
+    // Launch rasterization on every device before queuing reductions.
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
 
         for (const auto &segment: cameraGradients.segments(deviceId)) {
+            const auto gradients = WorldSpaceCameraGradients::fromTensors(segment.gradients);
             launchBackwardKernel<NUM_CHANNELS, Camera>(means,
                                                        quats,
                                                        logScales,
@@ -681,12 +698,11 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
                                                        dMeansLocals[deviceId],
                                                        dQuatsLocals[deviceId],
                                                        dLogScalesLocals[deviceId],
-                                                       segment.gradients[0],
-                                                       segment.gradients[1],
+                                                       gradients.features,
+                                                       gradients.opacities,
                                                        segment.tileOffset,
                                                        segment.tileCount,
-                                                       stream,
-                                                       segment.cameraOffset);
+                                                       stream);
         }
     }
 
@@ -726,9 +742,9 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    copyGradientShards<float>(dMeansLocals, dMeans);
-    copyGradientShards<float>(dQuatsLocals, dQuats);
-    copyGradientShards<float>(dLogScalesLocals, dLogScales);
+    copyGradientShards(dMeansLocals, dMeans);
+    copyGradientShards(dQuatsLocals, dQuats);
+    copyGradientShards(dLogScalesLocals, dLogScales);
 
     // Enqueue frees after the reductions and output copies, before merging the compute streams.
     dMeansLocals.clear();
