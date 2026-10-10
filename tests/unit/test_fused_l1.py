@@ -153,5 +153,5 @@ def test_fused_l1_with_ssim(image_device):
     result = torch.lerp(fused_l1_loss(actual, actual_target), 1.0 - ssim(actual, actual_target), 0.2)
     expected.backward()
     result.backward()
-    torch.testing.assert_close(result.cpu(), expected.detach(), rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(result.cpu(), expected.detach().cpu(), rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(actual.grad.cpu(), reference.grad.cpu(), rtol=2e-4, atol=2e-6)
