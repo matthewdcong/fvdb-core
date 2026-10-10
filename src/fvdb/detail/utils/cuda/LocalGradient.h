@@ -36,6 +36,12 @@ localGradientShardSize(int64_t numElements, int64_t deviceCount) {
 torch::Tensor
 makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaStream_t stream);
 
+/// As above, but pad for a reduction over rankCount participating devices.
+torch::Tensor makeLocalGradient(const torch::Tensor &tensor,
+                                c10::DeviceIndex deviceId,
+                                cudaStream_t stream,
+                                int64_t rankCount);
+
 } // namespace fvdb::detail
 
 #endif // FVDB_DETAIL_UTILS_CUDA_LOCALGRADIENT_H

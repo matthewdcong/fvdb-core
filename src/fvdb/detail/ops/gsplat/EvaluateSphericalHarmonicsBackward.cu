@@ -1081,7 +1081,7 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
                     C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
                 }
             }
-            copyGradientShards<scalar_t>(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
+            copyGradientShards(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
 
             // Enqueue frees after reduction and output copies, before merging the compute streams.
             dLossDWorldToCamMatricesLocals.clear();

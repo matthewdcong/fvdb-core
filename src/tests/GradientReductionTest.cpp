@@ -17,9 +17,26 @@
 
 namespace {
 
-using ReductionCase = std::tuple<int64_t, torch::ScalarType, bool>;
+enum class DeviceGroup { All, Reversed, Subgroup };
+
+using ReductionCase = std::tuple<int64_t, torch::ScalarType, bool, DeviceGroup>;
 
 class GradientReductionTest : public ::testing::TestWithParam<ReductionCase> {};
+
+TEST(GradientReductionValidationTest, RejectsIncompatibleCopyBuffers) {
+    const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto output        = torch::empty({2, 3}, options);
+    EXPECT_THROW(fvdb::detail::copyGradientShards({torch::empty({3, 2}, options)}, output),
+                 c10::Error);
+    EXPECT_THROW(fvdb::detail::copyGradientShards(
+                     {torch::empty({2, 3}, options.dtype(torch::kFloat64))}, output),
+                 c10::Error);
+    const auto transposed = torch::empty({3, 2}, options).transpose(0, 1);
+    EXPECT_THROW(fvdb::detail::copyGradientShards({transposed}, output), c10::Error);
+    output = transposed;
+    EXPECT_THROW(fvdb::detail::copyGradientShards({torch::empty({2, 3}, options)}, output),
+                 c10::Error);
+}
 
 TEST(GradientReductionValidationTest, RejectsNonzeroStorageOffset) {
     const int deviceCount = c10::cuda::device_count();
@@ -72,10 +89,23 @@ TEST_P(GradientReductionTest, MatchesIndependentSumAndPreservesLogicalShape) {
     if (deviceCount == 0) {
         GTEST_SKIP() << "CUDA is required for gradient reduction tests";
     }
-    const auto [numElements, dtype, useNonDefaultStreams] = GetParam();
+    const auto [numElements, dtype, useNonDefaultStreams, group] = GetParam();
+    std::vector<c10::DeviceIndex> devices;
+    for (const auto deviceId: c10::irange(deviceCount)) {
+        if (group != DeviceGroup::Subgroup || deviceId % 2 == 1) {
+            devices.push_back(deviceId);
+        }
+    }
+    if (devices.empty()) {
+        GTEST_SKIP() << "Subgroup tests require at least two CUDA devices";
+    }
+    if (group == DeviceGroup::Reversed) {
+        std::reverse(devices.begin(), devices.end());
+    }
+    const int64_t rankCount = devices.size();
     const c10::cuda::CUDAGuard deviceGuard(0);
     std::vector<c10::cuda::CUDAStream> streams;
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    for (const auto deviceId: devices) {
         streams.emplace_back(useNonDefaultStreams ? c10::cuda::getStreamFromPool(false, deviceId)
                                                   : c10::cuda::getDefaultCUDAStream(deviceId));
     }
@@ -85,11 +115,15 @@ TEST_P(GradientReductionTest, MatchesIndependentSumAndPreservesLogicalShape) {
     const auto shape = torch::zeros({}, options).expand({1, numElements});
     auto expected    = torch::zeros({numElements}, options);
     std::vector<torch::Tensor> localGradients;
-    const int64_t shardSize = fvdb::detail::localGradientShardSize(numElements, deviceCount);
-    const int64_t paddedNumElements = shardSize * deviceCount;
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    const int64_t shardSize         = fvdb::detail::localGradientShardSize(numElements, rankCount);
+    const int64_t paddedNumElements = shardSize * rankCount;
+    for (const auto rank: c10::irange(rankCount)) {
+        const auto deviceId = devices[rank];
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto gradient = fvdb::detail::makeLocalGradient(shape, deviceId, streams[deviceId]);
+        auto gradient =
+            group == DeviceGroup::All
+                ? fvdb::detail::makeLocalGradient(shape, deviceId, streams[rank])
+                : fvdb::detail::makeLocalGradient(shape, deviceId, streams[rank], rankCount);
         ASSERT_EQ(gradient.sizes(), shape.sizes());
         ASSERT_EQ(gradient.scalar_type(), dtype);
         ASSERT_TRUE(gradient.is_contiguous());
@@ -103,27 +137,45 @@ TEST_P(GradientReductionTest, MatchesIndependentSumAndPreservesLogicalShape) {
         localGradients.emplace_back(std::move(gradient));
     }
 
+    // A managed destination models DGX outputs. Guards around an offset view catch copies that
+    // accidentally publish padding or use the allocation base instead of the tensor's data pointer.
+    C10_CUDA_CHECK(cudaSetDevice(0));
+    void *outputData = nullptr;
+    C10_CUDA_CHECK(cudaMallocManaged(&outputData, (numElements + 2) * shape.element_size()));
+    auto outputStorage = torch::from_blob(
+        outputData,
+        {numElements + 2},
+        [](void *data) { C10_CUDA_CHECK(cudaFree(data)); },
+        options.device(torch::kCUDA, 0));
+    outputStorage.fill_(-99);
+    C10_CUDA_CHECK(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0)));
+    auto output = outputStorage.narrow(0, 1, numElements).view(shape.sizes());
+
     fvdb::detail::reduceGradientShards(localGradients);
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        C10_CUDA_CHECK(cudaStreamSynchronize(streams[deviceId]));
+    fvdb::detail::copyGradientShards(localGradients, output);
+    for (const auto rank: c10::irange(rankCount)) {
+        C10_CUDA_CHECK(cudaSetDevice(devices[rank]));
+        C10_CUDA_CHECK(cudaStreamSynchronize(streams[rank]));
     }
 
     // Reassemble the public logical shards independently of the reduction's padded views.
     auto actual = torch::empty_like(expected);
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        const int64_t begin = std::min<int64_t>(deviceId * shardSize, numElements);
-        const int64_t end   = std::min<int64_t>((deviceId + 1) * shardSize, numElements);
-        ASSERT_EQ(localGradients[deviceId].sizes(), shape.sizes());
+    for (const auto rank: c10::irange(rankCount)) {
+        const int64_t begin = std::min<int64_t>(rank * shardSize, numElements);
+        const int64_t end   = std::min<int64_t>((rank + 1) * shardSize, numElements);
+        ASSERT_EQ(localGradients[rank].sizes(), shape.sizes());
         actual.slice(0, begin, end)
-            .copy_(localGradients[deviceId].view({-1}).slice(0, begin, end).cpu());
-        const auto padding = localGradients[deviceId]
+            .copy_(localGradients[rank].view({-1}).slice(0, begin, end).cpu());
+        const auto padding = localGradients[rank]
                                  .as_strided({paddedNumElements}, {1})
                                  .slice(0, numElements, paddedNumElements)
                                  .cpu();
         EXPECT_EQ(padding.count_nonzero().item<int64_t>(), 0);
     }
     EXPECT_TRUE(torch::equal(actual, expected));
+    const auto expectedStorage = torch::full({numElements + 2}, -99, options);
+    expectedStorage.narrow(0, 1, numElements).copy_(expected);
+    EXPECT_TRUE(torch::equal(outputStorage.cpu(), expectedStorage));
 }
 
 INSTANTIATE_TEST_SUITE_P(ShapesAndStreams,
@@ -138,6 +190,9 @@ INSTANTIATE_TEST_SUITE_P(ShapesAndStreams,
                                                               int64_t{1024},
                                                               int64_t{1025}),
                                             ::testing::Values(torch::kFloat32, torch::kFloat64),
-                                            ::testing::Bool()));
+                                            ::testing::Bool(),
+                                            ::testing::Values(DeviceGroup::All,
+                                                              DeviceGroup::Reversed,
+                                                              DeviceGroup::Subgroup)));
 
 } // namespace

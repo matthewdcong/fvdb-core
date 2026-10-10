@@ -13,13 +13,20 @@ namespace fvdb::detail {
 
 torch::Tensor
 makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaStream_t stream) {
+    return makeLocalGradient(tensor, deviceId, stream, c10::cuda::device_count());
+}
+
+torch::Tensor
+makeLocalGradient(const torch::Tensor &tensor,
+                  c10::DeviceIndex deviceId,
+                  cudaStream_t stream,
+                  int64_t rankCount) {
     const c10::Device device(c10::kCUDA, deviceId);
     const auto options = tensor.options().device(device);
 
     const int64_t numElements       = tensor.numel();
-    const int64_t deviceCount       = c10::cuda::device_count();
-    const int64_t shardSize         = localGradientShardSize(numElements, deviceCount);
-    const int64_t paddedNumElements = shardSize * deviceCount;
+    const int64_t shardSize         = localGradientShardSize(numElements, rankCount);
+    const int64_t paddedNumElements = shardSize * rankCount;
     TORCH_CHECK(paddedNumElements <= std::numeric_limits<int64_t>::max() / tensor.element_size(),
                 "Local gradient allocation size overflows int64_t");
     const size_t numBytes = paddedNumElements * tensor.element_size();

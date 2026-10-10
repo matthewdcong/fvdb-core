@@ -14,23 +14,24 @@
 
 namespace fvdb::detail {
 
-// Reduce in place into each device's owned slice of its local gradient buffer.
-// Inputs must come from makeLocalGradient(), whose storage includes zeroed padding for equally
-// sized NCCL shards. The logical tensor shapes and deviceChunk() output ownership stay unchanged.
+// Reduce in place into each rank's owned slice of its local gradient buffer. Vector order defines
+// ranks; the tensors may reside on any distinct CUDA devices. Inputs must come from
+// makeLocalGradient() with padding for localGradients.size() equally sized NCCL shards.
 inline void
 reduceGradientShards(const std::vector<torch::Tensor> &localGradients) {
+    TORCH_CHECK(!localGradients.empty(), "Gradient reduction requires at least one local gradient");
     const int64_t numElements = localGradients.front().numel();
     if (numElements == 0) {
         return;
     }
 
-    const int64_t deviceCount       = c10::cuda::device_count();
-    const int64_t shardSize         = localGradientShardSize(numElements, deviceCount);
-    const int64_t paddedNumElements = shardSize * deviceCount;
-    std::vector<torch::Tensor> paddedGradients(deviceCount);
-    std::vector<torch::Tensor> reducedShards(deviceCount);
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        const auto &localGradient = localGradients[deviceId];
+    const int64_t rankCount         = localGradients.size();
+    const int64_t shardSize         = localGradientShardSize(numElements, rankCount);
+    const int64_t paddedNumElements = shardSize * rankCount;
+    std::vector<torch::Tensor> paddedGradients(rankCount);
+    std::vector<torch::Tensor> reducedShards(rankCount);
+    for (const auto rank: c10::irange(rankCount)) {
+        const auto &localGradient = localGradients[rank];
         TORCH_CHECK(
             localGradient.storage_offset() == 0,
             "Local gradient must start at the beginning of its storage; use makeLocalGradient()");
@@ -41,9 +42,8 @@ reduceGradientShards(const std::vector<torch::Tensor> &localGradients) {
                 storageBytes / elementSize == static_cast<size_t>(paddedNumElements),
             "Local gradient storage must match the padded reduction size; use makeLocalGradient()");
         // Expose the allocation's zeroed tail without copying or changing the logical gradient.
-        paddedGradients[deviceId] = localGradient.as_strided({paddedNumElements}, {1});
-        reducedShards[deviceId] =
-            paddedGradients[deviceId].narrow(0, deviceId * shardSize, shardSize);
+        paddedGradients[rank] = localGradient.as_strided({paddedNumElements}, {1});
+        reducedShards[rank]   = paddedGradients[rank].narrow(0, rank * shardSize, shardSize);
     }
 
     // NCCL supports in-place reduce-scatter when each receive buffer is its rank's input slice.
@@ -53,23 +53,35 @@ reduceGradientShards(const std::vector<torch::Tensor> &localGradients) {
 
 // Call after queuing the reductions and waiting for output prefetching on the current streams.
 // Keep the local gradient buffers alive until all output copies have been queued.
-template <typename ScalarType>
-void
+inline void
 copyGradientShards(const std::vector<torch::Tensor> &localGradients,
                    torch::Tensor &outputGradient) {
-    const int64_t numElements = localGradients.front().numel();
-    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-        const auto [shardOffset, shardSize] = deviceChunk(numElements, deviceId);
+    TORCH_CHECK(!localGradients.empty(), "Gradient copy requires at least one local gradient");
+    TORCH_CHECK(outputGradient.is_contiguous(), "Gradient copy requires contiguous outputs");
+    for (const auto &localGradient: localGradients) {
+        TORCH_CHECK(localGradient.is_contiguous() &&
+                        localGradient.sizes() == outputGradient.sizes() &&
+                        localGradient.scalar_type() == outputGradient.scalar_type(),
+                    "Gradient copy requires contiguous inputs with matching shapes and dtypes");
+    }
+
+    const int64_t numElements = outputGradient.numel();
+    const size_t elementSize  = outputGradient.element_size();
+    const auto rankCount      = localGradients.size();
+    for (const auto rank: c10::irange(rankCount)) {
+        const auto [shardOffset, shardSize] = deviceAlignedChunk(1, numElements, rank, rankCount);
         if (shardSize == 0) {
             continue;
         }
 
+        const auto deviceId = localGradients[rank].get_device();
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        const size_t byteOffset = shardOffset * elementSize;
         C10_CUDA_CHECK(
-            cudaMemcpyAsync(outputGradient.data_ptr<ScalarType>() + shardOffset,
-                            localGradients[deviceId].data_ptr<ScalarType>() + shardOffset,
-                            shardSize * sizeof(ScalarType),
+            cudaMemcpyAsync(static_cast<char *>(outputGradient.data_ptr()) + byteOffset,
+                            static_cast<const char *>(localGradients[rank].data_ptr()) + byteOffset,
+                            shardSize * elementSize,
                             cudaMemcpyDeviceToDevice,
                             stream));
     }
