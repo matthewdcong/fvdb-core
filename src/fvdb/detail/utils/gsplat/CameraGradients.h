@@ -28,7 +28,8 @@ class CameraGradients {
     };
 
     CameraGradients(const std::vector<torch::Tensor> &outputs, uint32_t tilesPerCamera)
-        : mOutputs(outputs), mSegments(c10::cuda::device_count()) {
+        : mOutputs(outputs), mSegments(c10::cuda::device_count()),
+          mOutputPrefetchEvents(c10::cuda::device_count(), nullptr) {
         TORCH_CHECK(!outputs.empty() && tilesPerCamera > 0 && !mSegments.empty(),
                     "Camera gradients require outputs, tiles, and CUDA devices");
         const auto cameraCount   = outputs.front().size(0);
@@ -42,7 +43,14 @@ class CameraGradients {
 
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             const auto [offset, count] = deviceChunk(tileCount, deviceId);
-            for (const auto &segment: partitionCameraTiles(offset, count, tilesPerCamera)) {
+            auto segments              = partitionCameraTiles(offset, count, tilesPerCamera);
+
+            // Shared cameras can rasterize into local buffers while outputs are prefetched.
+            std::partition(segments.begin(), segments.end(), [](const auto &segment) {
+                return segment.shared;
+            });
+
+            for (const auto &segment: segments) {
                 if (segment.shared) {
                     mSharedCameras[segment.cameraOffset].emplace_back(deviceId,
                                                                       mSegments[deviceId].size());
@@ -52,48 +60,69 @@ class CameraGradients {
         }
     }
 
-    // Called on each device after its prefetch stream has waited for preceding compute work.
-    // The caller must wait for this stream before launching rasterization on the current stream.
-    void
-    prepare(c10::DeviceIndex deviceId, cudaStream_t prefetchStream) {
-        const auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-        std::vector<void *> prefetchPointers;
-        std::vector<size_t> prefetchSizes;
-        for (auto &segment: mSegments[deviceId]) {
-            size_t rank      = 0;
-            size_t rankCount = 1;
-            if (segment.shared) {
-                const auto &owners = mSharedCameras.at(segment.cameraOffset);
-                const auto ownerIter =
-                    std::find_if(owners.begin(), owners.end(), [deviceId](const auto &owner) {
-                        return owner.first == deviceId;
-                    });
-                rank      = ownerIter - owners.begin();
-                rankCount = owners.size();
+    CameraGradients(const CameraGradients &)            = delete;
+    CameraGradients &operator=(const CameraGradients &) = delete;
+
+    ~CameraGradients() {
+        for (const auto event: mOutputPrefetchEvents) {
+            if (event != nullptr) {
+                C10_CUDA_CHECK_WARN(cudaEventDestroy(event));
             }
+        }
+    }
+
+    // Initialize local gradients before the compute stream waits for input prefetching.
+    void
+    prepare(c10::DeviceIndex deviceId) {
+        const auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        for (auto &segment: mSegments[deviceId]) {
+            const size_t rankCount =
+                segment.shared ? mSharedCameras.at(segment.cameraOffset).size() : 1;
             for (const auto &output: mOutputs) {
-                auto outputSlice = output.narrow(0, segment.cameraOffset, segment.cameraCount);
+                const auto outputSlice =
+                    output.narrow(0, segment.cameraOffset, segment.cameraCount);
                 segment.gradients.push_back(
                     segment.shared ? makeLocalGradient(outputSlice, deviceId, stream, rankCount)
                                    : outputSlice);
-                // Shared cameras publish one shard per contributor after reduce-scatter. Prefetch
-                // before rasterization can start writing fully owned cameras in the same outputs.
+            }
+        }
+    }
+
+    // Call after recording input readiness on the prefetch stream. Queue output prefetches on
+    // every device before launching rasterization; only output writers need to wait for them.
+    void
+    prefetchOutputs(c10::DeviceIndex deviceId, cudaStream_t prefetchStream) {
+        std::vector<void *> prefetchPointers;
+        std::vector<size_t> prefetchSizes;
+        for (const auto &segment: mSegments[deviceId]) {
+            size_t rank      = 0;
+            size_t rankCount = 1;
+            if (segment.shared) {
+                // A camera's tile interval spans consecutive device chunks.
+                const auto &owners = mSharedCameras.at(segment.cameraOffset);
+                rank               = deviceId - owners.front().first;
+                rankCount          = owners.size();
+            }
+
+            for (const auto &output: mOutputs) {
+                const auto outputSlice =
+                    output.narrow(0, segment.cameraOffset, segment.cameraCount);
+
+                // Shared cameras publish one shard per contributor after reduce-scatter.
                 const auto [elementOffset, elementCount] =
                     deviceAlignedChunk(1, outputSlice.numel(), rank, rankCount);
                 if (elementCount > 0) {
-                    prefetchPointers.push_back(static_cast<char *>(outputSlice.data_ptr()) +
-                                               elementOffset * outputSlice.element_size());
-                    prefetchSizes.push_back(elementCount * outputSlice.element_size());
+                    prefetchPointers.emplace_back(static_cast<char *>(outputSlice.data_ptr()) +
+                                                  elementOffset * outputSlice.element_size());
+                    prefetchSizes.emplace_back(elementCount * outputSlice.element_size());
                 }
             }
         }
+
         memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
-        for (const auto &segment: mSegments[deviceId]) {
-            if (!segment.shared) {
-                perCameraMemsetAsync(
-                    mOutputs, segment.cameraOffset, segment.cameraCount, 0, prefetchStream);
-            }
-        }
+        C10_CUDA_CHECK(
+            cudaEventCreateWithFlags(&mOutputPrefetchEvents[deviceId], cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(mOutputPrefetchEvents[deviceId], prefetchStream));
     }
 
     const std::vector<Segment> &
@@ -101,14 +130,30 @@ class CameraGradients {
         return mSegments[deviceId];
     }
 
-    // All raster launches must be queued first. Reduce shared cameras over their contributors,
-    // then publish each contributor's shard after all reductions have been queued.
+    // Called before each segment's raster launch. Shared gradients were initialized in prepare();
+    // fully owned gradients must wait for output prefetching before being zeroed.
+    void
+    prepareForRasterization(c10::DeviceIndex deviceId, const Segment &segment) const {
+        if (segment.shared) {
+            return;
+        }
+
+        waitForOutputs(deviceId);
+        perCameraMemsetAsync(mOutputs,
+                             segment.cameraOffset,
+                             segment.cameraCount,
+                             0,
+                             c10::cuda::getCurrentCUDAStream(deviceId));
+    }
+
+    // Call after all raster launches. Queue all shared-camera reductions before waiting for
+    // output prefetching and copying each contributor's shard.
     // Release buffers after queuing their last use, before the caller merges compute streams.
     void
     finalize() {
         std::vector<std::pair<torch::Tensor, std::vector<torch::Tensor>>> reductions;
         for (const auto &[camera, owners]: mSharedCameras) {
-            for (size_t i = 0; i < mOutputs.size(); ++i) {
+            for (const auto i: c10::irange(mOutputs.size())) {
                 auto &[output, partials] = reductions.emplace_back(mOutputs[i].narrow(0, camera, 1),
                                                                    std::vector<torch::Tensor>{});
                 for (const auto &[deviceId, segmentIndex]: owners) {
@@ -117,6 +162,16 @@ class CameraGradients {
                 reduceGradientShards(partials);
             }
         }
+
+        if (!reductions.empty()) {
+            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+                // Devices with a fully owned segment already waited before zeroing its outputs.
+                if (!mSegments[deviceId].empty() && !hasOwnedCameras(deviceId)) {
+                    waitForOutputs(deviceId);
+                }
+            }
+        }
+
         for (auto &[output, partials]: reductions) {
             copyGradientShards(partials, output);
         }
@@ -124,9 +179,29 @@ class CameraGradients {
     }
 
   private:
+    bool
+    hasOwnedCameras(c10::DeviceIndex deviceId) const {
+        const auto &segments = mSegments[deviceId];
+        return std::any_of(
+            segments.begin(), segments.end(), [](const auto &segment) { return !segment.shared; });
+    }
+
+    void
+    waitForOutputs(c10::DeviceIndex deviceId) const {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        const auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+
+        // Adjacent camera slices and reduction shards can share pages. Finish every device's
+        // discard/prefetch before any output writes, including zeroing fully owned gradients.
+        for (const auto event: mOutputPrefetchEvents) {
+            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, event));
+        }
+    }
+
     std::vector<torch::Tensor> mOutputs;
     std::vector<std::vector<Segment>> mSegments;
     std::map<uint32_t, std::vector<std::pair<c10::DeviceIndex, size_t>>> mSharedCameras;
+    std::vector<cudaEvent_t> mOutputPrefetchEvents;
 };
 
 } // namespace fvdb::detail
