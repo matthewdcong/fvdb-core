@@ -1447,8 +1447,11 @@ intersectGaussianTilesPrivateUse1Impl(
     std::vector<int64_t> deviceIntersectionOffset(c10::cuda::device_count());
     std::vector<int64_t> deviceIntersectionCount(c10::cuda::device_count());
     int64_t totalIntersections = 0;
-    int64_t *deviceTotals      = nullptr;
-    C10_CUDA_CHECK(cudaMallocHost(&deviceTotals, c10::cuda::device_count() * sizeof(int64_t)));
+    // Use PyTorch's caching host allocator to reuse pinned storage across calls.
+    torch::Tensor deviceTotalsStorage = torch::empty(
+        {c10::cuda::device_count()},
+        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true));
+    auto *deviceTotals = deviceTotalsStorage.data_ptr<int64_t>();
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -1474,7 +1477,6 @@ intersectGaussianTilesPrivateUse1Impl(
         deviceIntersectionCount[deviceId]  = deviceTotals[deviceId];
         totalIntersections += deviceTotals[deviceId];
     }
-    C10_CUDA_CHECK(cudaFreeHost(deviceTotals));
 
     if (totalIntersections == 0) {
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
