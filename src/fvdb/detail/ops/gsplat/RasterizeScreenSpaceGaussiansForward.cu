@@ -21,6 +21,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Exception.h>
 
+#include <cuda/cmath>
 #include <cuda/std/tuple>
 
 #include <cstdint>
@@ -718,6 +719,7 @@ launchRasterizeForwardKernels(
 
     std::vector<torch::Tensor> tileTensors = {
         tileOffsets, reshapedAlphas, reshapedLastIds, reshapedFeatures};
+    std::vector<torch::Tensor> gaussianTensors = {means2d, conics, features, opacities};
 
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -737,6 +739,20 @@ launchRasterizeForwardKernels(
                                               renderWindow.width,
                                               tileSize};
             appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, tileTensors, tileRange);
+            if constexpr (!IS_PACKED) {
+                if (!isSparse) {
+                    // Prefetch Gaussian inputs only for cameras fully owned by this device.
+                    const int64_t cameraOffset = cuda::ceil_div(deviceTileOffset, tilesPerCamera);
+                    const int64_t cameraEnd = (deviceTileOffset + deviceTileCount) / tilesPerCamera;
+                    if (cameraOffset < cameraEnd) {
+                        appendPerCameraPrefetchRanges(prefetchPointers,
+                                                      prefetchSizes,
+                                                      gaussianTensors,
+                                                      cameraOffset,
+                                                      cameraEnd - cameraOffset);
+                    }
+                }
+            }
             memPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
         }
         C10_CUDA_CHECK(cudaEventRecord(events[deviceId], prefetchStream));

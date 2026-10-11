@@ -18,6 +18,8 @@
 #include <c10/core/DeviceType.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <cuda/cmath>
+
 #include <cooperative_groups.h>
 
 namespace fvdb::detail::ops {
@@ -1282,8 +1284,9 @@ callRasterizeBackwardPrivateUse1(
     // Compute tile count: for sparse mode use activeTiles, for dense mode compute from image dims
     const int64_t tileCount =
         activeTiles.has_value() ? activeTiles.value().size(0) : C * tilesPerCamera;
-    std::vector<torch::Tensor> tileTensors = {dLossDRenderedFeatures.jdata(),
-                                              dLossDRenderedAlphas.jdata()};
+    std::vector<torch::Tensor> tileTensors     = {dLossDRenderedFeatures.jdata(),
+                                                  dLossDRenderedAlphas.jdata()};
+    std::vector<torch::Tensor> gaussianTensors = {means2d, conics, features, opacities};
 
     const ScreenSpaceGradients outputs{outDLossDMeans2d,
                                        outDLossDConics,
@@ -1345,6 +1348,18 @@ callRasterizeBackwardPrivateUse1(
                                               renderWindow.width,
                                               tileSize};
             appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, tileTensors, tileRange);
+            if (cameraGradients.has_value()) {
+                // Prefetch Gaussian inputs only for cameras fully owned by this device.
+                const int64_t cameraOffset = cuda::ceil_div(deviceTileOffset, tilesPerCamera);
+                const int64_t cameraEnd = (deviceTileOffset + deviceTileCount) / tilesPerCamera;
+                if (cameraOffset < cameraEnd) {
+                    appendPerCameraPrefetchRanges(prefetchPointers,
+                                                  prefetchSizes,
+                                                  gaussianTensors,
+                                                  cameraOffset,
+                                                  cameraEnd - cameraOffset);
+                }
+            }
 
             memPrefetchBatchAsync(
                 prefetchPointers, prefetchSizes, deviceId, prefetchStreams[deviceId]);
