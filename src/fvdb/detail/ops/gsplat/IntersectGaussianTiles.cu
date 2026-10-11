@@ -1350,6 +1350,13 @@ intersectGaussianTilesPrivateUse1Impl(
     std::vector<uint32_t> deviceGaussianOffset(c10::cuda::device_count());
     std::vector<uint32_t> deviceGaussianCount(c10::cuda::device_count());
     std::vector<int64_t *> deviceTilesPerGaussianCumsum(c10::cuda::device_count(), nullptr);
+    std::vector<cudaEvent_t> inputPrefetchEvents(c10::cuda::device_count(), nullptr);
+
+    std::vector<torch::Tensor> inputTensors = {means2d, radii, depths};
+    if (conics.has_value()) {
+        inputTensors.push_back(conics.value());
+        inputTensors.push_back(opacities.value());
+    }
 
     // Prefetch projected Gaussian parameters here for both intersection and subsequent forward
     // rasterization. Features are only used by rasterization and are prefetched there.
@@ -1372,6 +1379,24 @@ intersectGaussianTilesPrivateUse1Impl(
             const uint32_t cameraCount  = cuda::ceil_div(keyEnd, totalTiles) - cameraOffset;
             deviceGaussianOffset[deviceId] = cameraOffset * numGaussians;
             deviceGaussianCount[deviceId]  = cameraCount * numGaussians;
+
+            // Prefetch only cameras fully owned by this device, after their producers.
+            // Overlap prefetch with count/scan and output preparation.
+            const int64_t prefetchCameraOffset = cuda::ceil_div(keyStart, totalTiles);
+            const int64_t prefetchCameraEnd    = keyEnd / totalTiles;
+            if (prefetchCameraOffset < prefetchCameraEnd) {
+                C10_CUDA_CHECK(cudaEventCreateWithFlags(&inputPrefetchEvents[deviceId],
+                                                       cudaEventDisableTiming));
+                C10_CUDA_CHECK(cudaEventRecord(inputPrefetchEvents[deviceId], stream));
+                auto prefetchStream = c10::cuda::getStreamFromPool(false, deviceId);
+                C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStream, inputPrefetchEvents[deviceId]));
+                perCameraPrefetchBatchAsync(inputTensors,
+                                           prefetchCameraOffset,
+                                           prefetchCameraEnd - prefetchCameraOffset,
+                                           deviceId,
+                                           prefetchStream);
+                C10_CUDA_CHECK(cudaEventRecord(inputPrefetchEvents[deviceId], prefetchStream));
+            }
         }
 
         const uint32_t gaussianOffset = deviceGaussianOffset[deviceId];
@@ -1455,6 +1480,11 @@ intersectGaussianTilesPrivateUse1Impl(
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+            // Complete outstanding input prefetches before the empty return.
+            if (inputPrefetchEvents[deviceId] != nullptr) {
+                C10_CUDA_CHECK(cudaEventSynchronize(inputPrefetchEvents[deviceId]));
+                C10_CUDA_CHECK(cudaEventDestroy(inputPrefetchEvents[deviceId]));
+            }
             if (deviceTilesPerGaussianCumsum[deviceId] != nullptr) {
                 C10_CUDA_CHECK(cudaFreeAsync(deviceTilesPerGaussianCumsum[deviceId], stream));
             }
@@ -1539,6 +1569,13 @@ intersectGaussianTilesPrivateUse1Impl(
             const uint32_t gaussianCount  = deviceGaussianCount[deviceId];
             if (gaussianCount == 0) {
                 continue;
+            }
+
+            // Wait only before emission so totals readback and output preparation can overlap
+            // input migration. Retire each event on the device that created it.
+            if (inputPrefetchEvents[deviceId] != nullptr) {
+                C10_CUDA_CHECK(cudaStreamWaitEvent(stream, inputPrefetchEvents[deviceId]));
+                C10_CUDA_CHECK(cudaEventDestroy(inputPrefetchEvents[deviceId]));
             }
 
             size_t deviceKeyOffset, deviceKeyCount;
