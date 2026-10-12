@@ -14,6 +14,7 @@
 #include <fvdb/detail/utils/gsplat/Gaussian2D.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianMath.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterize.cuh>
+#include <fvdb/detail/utils/gsplat/GaussianRasterizeKernel.cuh>
 
 #include <nanovdb/math/Math.h>
 
@@ -30,17 +31,11 @@
 namespace fvdb::detail::ops {
 namespace {
 
-// Structure to hold arguments and methods for the rasterize forward kernel
-template <typename ScalarType, uint32_t NUM_CHANNELS, uint32_t NUM_SHARED_CHANNELS, bool IS_PACKED>
-struct RasterizeForwardArgs {
-    using CommonArgs = RasterizeCommonArgs<ScalarType, NUM_CHANNELS, IS_PACKED>;
+// Channel counts specialize device methods, but not the argument layout or host setup. This
+// avoids repeating tensor preparation for every kernel while preserving compile-time loop bounds.
+template <typename ScalarType, bool IS_PACKED> struct RasterizeForwardArgs {
+    using CommonArgs = RasterizeCommonArgs<ScalarType, IS_PACKED>;
     CommonArgs commonArgs;
-
-    constexpr static bool IS_CHUNKED = (NUM_CHANNELS != NUM_SHARED_CHANNELS);
-
-    // Preserve full unrolling for small feature vectors while bounding compiler work for the
-    // 512/513-channel kernels, as in the world-space rasterizer.
-    enum : uint32_t { CHANNEL_UNROLL = NUM_CHANNELS <= 32 ? NUM_CHANNELS : 4 };
 
     JaggedRAcc64<ScalarType, 2> mOutFeatures; // [[nPixels, NUM_CHANNELS]_0..._C]
     JaggedRAcc64<ScalarType, 2> mOutAlphas;   // [[nPixels, 1]_0..._C]
@@ -68,7 +63,7 @@ struct RasterizeForwardArgs {
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt) // [AP]
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt)        // [AP]
         : commonArgs(means2d,
                      conics,
                      opacities,
@@ -109,23 +104,24 @@ struct RasterizeForwardArgs {
     /// @param channelStart The first output channel in the chunk
     /// @param numChannels The number of output channels in the chunk
     /// @param f The function to write the features
-    template <typename F>
+    template <typename Channels, typename F>
     __device__ void
     writeFeatureChunk(uint64_t pixelIndex, size_t channelStart, size_t numChannels, F &&f) {
-        if constexpr (IS_CHUNKED) {
+        if constexpr (Channels::IS_CHUNKED) {
             for (uint32_t k = 0; k < numChannels; ++k) {
                 mOutFeatures.data()[pixelIndex][channelStart + k] = f(k);
             }
         } else {
-            assert(channelStart == 0 && numChannels == NUM_CHANNELS);
-#pragma unroll CHANNEL_UNROLL
-            for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
+            assert(channelStart == 0 && numChannels == Channels::COUNT);
+#pragma unroll Channels::UNROLL
+            for (uint32_t k = 0; k < Channels::COUNT; ++k) {
                 mOutFeatures.data()[pixelIndex][k] = f(k);
             }
         }
     }
 
     // Fetch the features for a Gaussian into shared memory
+    template <typename Channels>
     inline __device__ void
     fetchGaussianFeatureIntoSharedMemory(const int32_t g,
                                          const size_t channelStart,
@@ -137,19 +133,19 @@ struct RasterizeForwardArgs {
                 outFeatures[k] = featureAccessor[k + channelStart];
             }
         } else {
-            // colors: [C, N, NUM_CHANNELS]
-            // colors[c, n, k] = [c * N * NUM_CHANNELS + n * NUM_CHANNELS + k]
+            // colors: [C, N, Channels::COUNT]
+            // colors[c, n, k] = [c * N * Channels::COUNT + n * Channels::COUNT + k]
             // g = c * N + n
             const int32_t cid          = g / commonArgs.mNumGaussiansPerCamera;
             const int32_t gid          = g % commonArgs.mNumGaussiansPerCamera;
             const auto featureAccessor = commonArgs.mFeatures[cid][gid];
-            if constexpr (IS_CHUNKED) {
+            if constexpr (Channels::IS_CHUNKED) {
                 for (auto k = 0; k < numChannels; ++k) {
                     outFeatures[k] = featureAccessor[k + channelStart];
                 }
             } else {
-#pragma unroll CHANNEL_UNROLL
-                for (auto k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+                for (auto k = 0; k < Channels::COUNT; ++k) {
                     outFeatures[k] = featureAccessor[k];
                 }
             }
@@ -165,6 +161,7 @@ struct RasterizeForwardArgs {
     /// @param activePixelIndex The index of the active pixel
     /// @param row The row of the pixel
     /// @param col The column of the pixel
+    template <typename Channels>
     __device__ void
     volumeRenderTileForward(const uint32_t cameraId,
                             const uint32_t row,
@@ -178,7 +175,7 @@ struct RasterizeForwardArgs {
 
         auto *sharedGaussians = reinterpret_cast<Gaussian2D<ScalarType> *>(s); // [blockSize]
         ScalarType *sharedGaussianFeatures = reinterpret_cast<ScalarType *>(
-            &sharedGaussians[blockSize]); // [blockSize * NUM_SHARED_CHANNELS]
+            &sharedGaussians[blockSize]); // [blockSize * Channels::SHARED_COUNT]
 
         // Process Gaussians in batches of block size (i.e. one Gaussian per thread in the block)
         const uint32_t tidx = threadIdx.y * blockDim.x + threadIdx.x;
@@ -193,20 +190,18 @@ struct RasterizeForwardArgs {
         // collect and process batches of gaussians
         // each thread loads one gaussian at a time before rasterizing its
         // designated pixel
-        constexpr size_t NUM_CHUNKS =
-            (NUM_CHANNELS + NUM_SHARED_CHANNELS - 1) / NUM_SHARED_CHANNELS;
 
         const auto pixIdx = commonArgs.pixelIndex(cameraId, row, col, activePixelIndex);
 
-        for (size_t chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
-            const size_t channelStart = chunk * NUM_SHARED_CHANNELS;
+        for (size_t chunk = 0; chunk < Channels::CHUNK_COUNT; ++chunk) {
+            const size_t channelStart = chunk * Channels::SHARED_COUNT;
             const size_t numChannels =
-                min(NUM_CHANNELS - channelStart, static_cast<size_t>(NUM_SHARED_CHANNELS));
+                min(Channels::COUNT - channelStart, static_cast<size_t>(Channels::SHARED_COUNT));
 
             // Keep only the current channel chunk in thread-local storage. In particular, avoid a
-            // NUM_CHANNELS-sized array here: that causes the compiler to scalarize and duplicate
+            // Channels::COUNT-sized array here: that causes the compiler to scalarize and duplicate
             // the entire high-channel output state in every shared-memory specialization.
-            ScalarType pixOut[NUM_SHARED_CHANNELS] = {0.f};
+            ScalarType pixOut[Channels::SHARED_COUNT] = {0.f};
 
             // NOTE: The accumulated transmittance is used in the backward pass, and
             // since it's a sum of many small numbers, we should really use double precision.
@@ -242,8 +237,10 @@ struct RasterizeForwardArgs {
                     // position, so gaussianIsValid will be false and features are never
                     // read in the rendering loop.
                     if (sharedGaussians[tidx].opacity >= 1.f / 255.f) {
-                        ScalarType *feature = &sharedGaussianFeatures[tidx * NUM_SHARED_CHANNELS];
-                        fetchGaussianFeatureIntoSharedMemory(g, channelStart, numChannels, feature);
+                        ScalarType *feature =
+                            &sharedGaussianFeatures[tidx * Channels::SHARED_COUNT];
+                        fetchGaussianFeatureIntoSharedMemory<Channels>(
+                            g, channelStart, numChannels, feature);
                     }
                 }
 
@@ -275,16 +272,16 @@ struct RasterizeForwardArgs {
                         }
 
                         const ScalarType vis = alpha * accumTransmittance;
-                        if constexpr (IS_CHUNKED) {
+                        if constexpr (Channels::IS_CHUNKED) {
                             for (uint32_t k = 0; k < numChannels; ++k) {
                                 pixOut[k] +=
-                                    sharedGaussianFeatures[t * NUM_SHARED_CHANNELS + k] * vis;
+                                    sharedGaussianFeatures[t * Channels::SHARED_COUNT + k] * vis;
                             }
                         } else {
-#pragma unroll CHANNEL_UNROLL
-                            for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+                            for (uint32_t k = 0; k < Channels::COUNT; ++k) {
                                 pixOut[k] +=
-                                    sharedGaussianFeatures[t * NUM_SHARED_CHANNELS + k] * vis;
+                                    sharedGaussianFeatures[t * Channels::SHARED_COUNT + k] * vis;
                             }
                         }
 
@@ -302,7 +299,7 @@ struct RasterizeForwardArgs {
                     writeAlpha(pixIdx, 1.0f - accumTransmittance);
                     writeLastId(pixIdx, lastIntersectionOffset);
                 }
-                writeFeatureChunk(pixIdx, channelStart, numChannels, [&](uint32_t k) {
+                writeFeatureChunk<Channels>(pixIdx, channelStart, numChannels, [&](uint32_t k) {
                     return commonArgs.mHasBackgrounds
                                ? pixOut[k] + accumTransmittance *
                                                  commonArgs.mBackgrounds[cameraId][channelStart + k]
@@ -317,8 +314,9 @@ struct RasterizeForwardArgs {
 /// @param args The arguments for the rasterization
 template <typename ScalarType, uint32_t NUM_CHANNELS, uint32_t NUM_SHARED_CHANNELS, bool IS_PACKED>
 __global__ void
-rasterizeGaussiansForward(
-    RasterizeForwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args) {
+rasterizeGaussiansForward(RasterizeForwardArgs<ScalarType, IS_PACKED> args) {
+    using Channels = RasterizeChannels<NUM_CHANNELS, NUM_SHARED_CHANNELS>;
+
     auto &commonArgs = args.commonArgs;
 
     int32_t cameraId;
@@ -351,7 +349,7 @@ rasterizeGaussiansForward(
             auto pixIdx = commonArgs.pixelIndex(cameraId, row, col, activePixelIndex);
             args.writeAlpha(pixIdx, 0.0f);
             args.writeLastId(pixIdx, -1);
-            args.writeFeatureChunk(pixIdx, 0, NUM_CHANNELS, [&](uint32_t k) {
+            args.template writeFeatureChunk<Channels>(pixIdx, 0, NUM_CHANNELS, [&](uint32_t k) {
                 return commonArgs.mHasBackgrounds ? commonArgs.mBackgrounds[cameraId][k] : 0.0f;
             });
         }
@@ -363,14 +361,14 @@ rasterizeGaussiansForward(
     cuda::std::tie(firstGaussianIdInBlock, lastGaussianIdInBlock) =
         commonArgs.tileGaussianRange(cameraId, tileRow, tileCol);
 
-    args.volumeRenderTileForward(cameraId,
-                                 row,
-                                 col,
-                                 firstGaussianIdInBlock,
-                                 lastGaussianIdInBlock,
-                                 blockDim.x * blockDim.y,
-                                 pixelInImage,
-                                 activePixelIndex);
+    args.template volumeRenderTileForward<Channels>(cameraId,
+                                                    row,
+                                                    col,
+                                                    firstGaussianIdInBlock,
+                                                    lastGaussianIdInBlock,
+                                                    blockDim.x * blockDim.y,
+                                                    pixelInImage,
+                                                    activePixelIndex);
 }
 
 /// @brief Get the shared memory requirements for the forward pass kernel
@@ -383,9 +381,11 @@ getSharedMemRequirements(const size_t numChannels, const size_t tileSize) {
            (sizeof(Gaussian2D<ScalarType>) + numChannels * sizeof(ScalarType));
 }
 
-template <typename ScalarType, uint32_t NUM_CHANNELS, uint32_t NUM_SHARED_CHANNELS, bool IS_PACKED>
+template <typename ScalarType, bool IS_PACKED>
 std::tuple<fvdb::JaggedTensor, fvdb::JaggedTensor, fvdb::JaggedTensor>
-launchRasterizeForwardKernelWithTemplatedSharedChannels(
+launchRasterizeForwardKernelWithSharedChannels(
+    RasterizeKernel<RasterizeForwardArgs<ScalarType, IS_PACKED>> kernel,
+    const size_t numSharedChannels,
     // Gaussian parameters
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,                    // [C, N, 3] or [nnz, 3]
@@ -447,51 +447,51 @@ launchRasterizeForwardKernelWithTemplatedSharedChannels(
     auto outAlphas   = fvdb::JaggedTensor(alphasToRenderVec);
     auto outLastIds  = fvdb::JaggedTensor(lastIdsToRenderVec);
 
-    auto args = RasterizeForwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>(
-        means2d,
-        conics,
-        opacities,
-        features,
-        backgrounds,
-        masks,
-        renderWindow,
-        tileSize,
-        0,
-        tileOffsets,
-        tileGaussianIds,
-        outFeatures,
-        outAlphas,
-        outLastIds,
-        activeTiles,
-        tilePixelMask,
-        tilePixelCumsum,
-        pixelMap);
+    auto args = RasterizeForwardArgs<ScalarType, IS_PACKED>(means2d,
+                                                            conics,
+                                                            opacities,
+                                                            features,
+                                                            backgrounds,
+                                                            masks,
+                                                            renderWindow,
+                                                            tileSize,
+                                                            0,
+                                                            tileOffsets,
+                                                            tileGaussianIds,
+                                                            outFeatures,
+                                                            outAlphas,
+                                                            outLastIds,
+                                                            activeTiles,
+                                                            tilePixelMask,
+                                                            tilePixelCumsum,
+                                                            pixelMap);
 
     const at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
     // Thread blocks cooperatively cache a tile of Gaussians in shared memory.
-    // The chunked path uses a stride of NUM_SHARED_CHANNELS in the cache; we mirror the
+    // The chunked path uses a stride of numSharedChannels in the cache; we mirror the
     // backward's `+1` channel of buffer space when chunking is enabled.
-    const size_t numShmChannels =
-        (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
-    const uint32_t sharedMem = getSharedMemRequirements<ScalarType>(numShmChannels, tileSize);
+    const size_t numShmChannels = (numSharedChannels == static_cast<size_t>(features.size(-1)))
+                                      ? features.size(-1)
+                                      : numSharedChannels + 1;
+    const uint32_t sharedMem    = getSharedMemRequirements<ScalarType>(numShmChannels, tileSize);
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
     // writes. This requires moving the channel padding from python to C side.
-    if (cudaFuncSetAttribute(
-            rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            sharedMem) != cudaSuccess) {
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMem) !=
+        cudaSuccess) {
         AT_ERROR("Failed to set maximum shared memory size (requested ",
                  sharedMem,
                  " bytes), try lowering tile_size.");
     }
 
-    rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>
-        <<<args.commonArgs.getGridDim(), args.commonArgs.getBlockDim(), sharedMem, stream>>>(args);
-
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    launchRasterizeKernel(kernel,
+                          args.commonArgs.getGridDim(),
+                          args.commonArgs.getBlockDim(),
+                          args,
+                          sharedMem,
+                          stream);
 
     // In dense mode, we need to reshape the output tensors to the original image size
     // because they are packed into a single JaggedTensor so that the output code is the same
@@ -534,86 +534,15 @@ launchRasterizeForwardKernel(
 
     auto callWithSharedChannels = [&](size_t numSharedChannels)
         -> std::tuple<fvdb::JaggedTensor, fvdb::JaggedTensor, fvdb::JaggedTensor> {
+        RasterizeKernel<RasterizeForwardArgs<ScalarType, IS_PACKED>> kernel;
         if (numSharedChannels == NUM_CHANNELS) {
-            return launchRasterizeForwardKernelWithTemplatedSharedChannels<ScalarType,
-                                                                           NUM_CHANNELS,
-                                                                           NUM_CHANNELS,
-                                                                           IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                pixelsToRender,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, NUM_CHANNELS, IS_PACKED>;
         } else if (numSharedChannels == 64) {
-            return launchRasterizeForwardKernelWithTemplatedSharedChannels<ScalarType,
-                                                                           NUM_CHANNELS,
-                                                                           64,
-                                                                           IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                pixelsToRender,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, 64, IS_PACKED>;
         } else if (numSharedChannels == 32) {
-            return launchRasterizeForwardKernelWithTemplatedSharedChannels<ScalarType,
-                                                                           NUM_CHANNELS,
-                                                                           32,
-                                                                           IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                pixelsToRender,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, 32, IS_PACKED>;
         } else if (numSharedChannels == 16) {
-            return launchRasterizeForwardKernelWithTemplatedSharedChannels<ScalarType,
-                                                                           NUM_CHANNELS,
-                                                                           16,
-                                                                           IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                pixelsToRender,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, 16, IS_PACKED>;
         } else {
             if (numSharedChannelsOverride > 0) {
                 AT_ERROR("Invalid numSharedChannelsOverride. Must be 64, 32, or 16.");
@@ -621,6 +550,24 @@ launchRasterizeForwardKernel(
                 AT_ERROR("Failed to set maximum shared memory size");
             }
         }
+        return launchRasterizeForwardKernelWithSharedChannels<ScalarType, IS_PACKED>(
+            kernel,
+            numSharedChannels,
+            means2d,
+            conics,
+            features,
+            opacities,
+            backgrounds,
+            masks,
+            renderWindow,
+            tileSize,
+            tileOffsets,
+            tileGaussianIds,
+            pixelsToRender,
+            activeTiles,
+            tilePixelMask,
+            tilePixelCumsum,
+            pixelMap);
     };
 
     if (numSharedChannelsOverride > 0) {
@@ -640,9 +587,11 @@ launchRasterizeForwardKernel(
     }
 }
 
-template <typename ScalarType, uint32_t NUM_CHANNELS, uint32_t NUM_SHARED_CHANNELS, bool IS_PACKED>
+template <typename ScalarType, bool IS_PACKED>
 std::tuple<fvdb::JaggedTensor, fvdb::JaggedTensor, fvdb::JaggedTensor>
 launchRasterizeForwardKernels(
+    RasterizeKernel<RasterizeForwardArgs<ScalarType, IS_PACKED>> kernel,
+    const size_t numSharedChannels,
     // Gaussian parameters
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,                    // [C, N, 3] or [nnz, 3]
@@ -767,42 +716,39 @@ launchRasterizeForwardKernels(
         uint32_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) = deviceChunk(tileCount, deviceId);
         if (deviceTileCount) {
-            auto args =
-                RasterizeForwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>(
-                    means2d,
-                    conics,
-                    opacities,
-                    features,
-                    backgrounds,
-                    masks,
-                    renderWindow,
-                    tileSize,
-                    deviceTileOffset,
-                    tileOffsets,
-                    tileGaussianIds,
-                    outFeatures,
-                    outAlphas,
-                    outLastIds,
-                    activeTiles,
-                    tilePixelMask,
-                    tilePixelCumsum,
-                    pixelMap);
+            auto args = RasterizeForwardArgs<ScalarType, IS_PACKED>(means2d,
+                                                                    conics,
+                                                                    opacities,
+                                                                    features,
+                                                                    backgrounds,
+                                                                    masks,
+                                                                    renderWindow,
+                                                                    tileSize,
+                                                                    deviceTileOffset,
+                                                                    tileOffsets,
+                                                                    tileGaussianIds,
+                                                                    outFeatures,
+                                                                    outAlphas,
+                                                                    outLastIds,
+                                                                    activeTiles,
+                                                                    tilePixelMask,
+                                                                    tilePixelCumsum,
+                                                                    pixelMap);
 
             // Thread blocks cooperatively cache a tile of Gaussians in shared memory.
-            // The chunked path uses a stride of NUM_SHARED_CHANNELS in the cache; mirror the
+            // The chunked path uses a stride of numSharedChannels in the cache; mirror the
             // backward's `+1` channel of buffer space when chunking is enabled.
             const size_t numShmChannels =
-                (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
+                (numSharedChannels == static_cast<size_t>(features.size(-1)))
+                    ? features.size(-1)
+                    : numSharedChannels + 1;
             const uint32_t sharedMem =
                 getSharedMemRequirements<ScalarType>(numShmChannels, tileSize);
 
             // TODO: an optimization can be done by passing the actual number of
             // channels into the kernel functions and avoid necessary global memory
             // writes. This requires moving the channel padding from python to C side.
-            if (cudaFuncSetAttribute(rasterizeGaussiansForward<ScalarType,
-                                                               NUM_CHANNELS,
-                                                               NUM_SHARED_CHANNELS,
-                                                               IS_PACKED>,
+            if (cudaFuncSetAttribute(kernel,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      sharedMem) != cudaSuccess) {
                 AT_ERROR("Failed to set maximum shared memory size (requested ",
@@ -813,10 +759,7 @@ launchRasterizeForwardKernels(
             const dim3 blockDim = {tileSize, tileSize, 1};
             const dim3 gridDim  = {deviceTileCount, 1, 1};
 
-            rasterizeGaussiansForward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>
-                <<<gridDim, blockDim, sharedMem, stream>>>(args);
-
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            launchRasterizeKernel(kernel, gridDim, blockDim, args, sharedMem, stream);
         }
     }
 
@@ -983,29 +926,35 @@ dispatchRasterizeScreenSpaceGaussiansFwd<torch::kPrivateUse1>(
     case N: {                                                                                   \
         if (isPacked) {                                                                         \
             auto [outFeatures, outAlphas, outLastIds] =                                         \
-                launchRasterizeForwardKernels<float, N, N, true>(means2d,                       \
-                                                                 conics,                        \
-                                                                 features,                      \
-                                                                 opacities,                     \
-                                                                 backgrounds,                   \
-                                                                 masks,                         \
-                                                                 renderWindow,                  \
-                                                                 tileSize,                      \
-                                                                 tileOffsets,                   \
-                                                                 tileGaussianIds);              \
+                launchRasterizeForwardKernels<float, true>(                                     \
+                    rasterizeGaussiansForward<float, N, N, true>,                               \
+                    N,                                                                          \
+                    means2d,                                                                    \
+                    conics,                                                                     \
+                    features,                                                                   \
+                    opacities,                                                                  \
+                    backgrounds,                                                                \
+                    masks,                                                                      \
+                    renderWindow,                                                               \
+                    tileSize,                                                                   \
+                    tileOffsets,                                                                \
+                    tileGaussianIds);                                                           \
             return std::make_tuple(outFeatures.jdata(), outAlphas.jdata(), outLastIds.jdata()); \
         } else {                                                                                \
             auto [outFeatures, outAlphas, outLastIds] =                                         \
-                launchRasterizeForwardKernels<float, N, N, false>(means2d,                      \
-                                                                  conics,                       \
-                                                                  features,                     \
-                                                                  opacities,                    \
-                                                                  backgrounds,                  \
-                                                                  masks,                        \
-                                                                  renderWindow,                 \
-                                                                  tileSize,                     \
-                                                                  tileOffsets,                  \
-                                                                  tileGaussianIds);             \
+                launchRasterizeForwardKernels<float, false>(                                    \
+                    rasterizeGaussiansForward<float, N, N, false>,                              \
+                    N,                                                                          \
+                    means2d,                                                                    \
+                    conics,                                                                     \
+                    features,                                                                   \
+                    opacities,                                                                  \
+                    backgrounds,                                                                \
+                    masks,                                                                      \
+                    renderWindow,                                                               \
+                    tileSize,                                                                   \
+                    tileOffsets,                                                                \
+                    tileGaussianIds);                                                           \
             return std::make_tuple(outFeatures.jdata(), outAlphas.jdata(), outLastIds.jdata()); \
         }                                                                                       \
     }

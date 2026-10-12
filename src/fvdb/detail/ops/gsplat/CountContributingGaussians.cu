@@ -19,7 +19,7 @@ namespace {
 
 // Structure to hold arguments and methods for the rasterize num contributing gaussians kernel
 template <typename ScalarType, bool IS_PACKED> struct RasterizeNumContributingGaussiansArgs {
-    using CommonArgs = RasterizeCommonArgs<ScalarType, 1, IS_PACKED>;
+    using CommonArgs = RasterizeCommonArgs<ScalarType, IS_PACKED>;
     CommonArgs commonArgs;
 
     // In Dense mode, first dimension X = C * imageHeight * imageWidth

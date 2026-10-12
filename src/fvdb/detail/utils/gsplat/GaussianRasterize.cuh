@@ -79,9 +79,8 @@ initJaggedAccessor(const fvdb::JaggedTensor &tensor, const std::string &name) {
 
 /// @brief Common fields and helpers for both forward and backward rasterization kernels
 /// @tparam ScalarType The scalar type of the Gaussian
-/// @tparam NUM_CHANNELS The number of channels of the Gaussian
 /// @tparam IS_PACKED Whether the Gaussian is packed (i.e. linearized across the outer dimensions)
-template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct RasterizeCommonArgs {
+template <typename ScalarType, bool IS_PACKED> struct RasterizeCommonArgs {
     constexpr static size_t NUM_OUTER_DIMS         = IS_PACKED ? 1 : 2;
     constexpr static ScalarType ALPHA_THRESHOLD    = ScalarType{0.99};
     using vec2t                                    = nanovdb::math::Vec2<ScalarType>;
@@ -148,7 +147,7 @@ template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct Raste
         const std::optional<torch::Tensor> &tilePixelMask =
             std::nullopt, // [AT, wordsPerTileBitmask] e.g. [AT, 4]
         const std::optional<torch::Tensor> &tilePixelCumsum = std::nullopt, // [AT]
-        const std::optional<torch::Tensor> &pixelMap        = std::nullopt) // [AP]
+        const std::optional<torch::Tensor> &pixelMap        = std::nullopt)        // [AP]
         : mRenderWindow(renderWindow), mTileOriginW(renderWindow.originW / tileSize),
           mTileOriginH(renderWindow.originH / tileSize), mTileSize(tileSize),
           mMeans2d(initAccessor<ScalarType, NUM_OUTER_DIMS + 1>(means2d, "means2d")),
@@ -222,6 +221,9 @@ template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct Raste
     // Check that the input tensor shapes are valid
     void
     checkInputShapes() {
+        // Feature rendering derives its channel count from the input tensor. Analysis kernels
+        // omit features and accept a single background channel.
+        const int64_t numChannels = mHasFeatures ? mFeatures.size(NUM_OUTER_DIMS) : 1;
         // activePixelIndex() uses a cub::BlockScan fixed at 16x16 threads on the sparse path.
         TORCH_CHECK_VALUE(!mIsSparse || mTileSize == 16,
                           "Sparse rasterization requires tileSize == 16, got ",
@@ -247,8 +249,6 @@ template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct Raste
         }
 
         if (mHasFeatures) {
-            TORCH_CHECK_VALUE(NUM_CHANNELS == mFeatures.size(NUM_OUTER_DIMS),
-                              "Bad size for features");
             if constexpr (IS_PACKED) {
                 TORCH_CHECK_VALUE(totalGaussians == mFeatures.size(0), "Bad size for features");
             } else {
@@ -259,7 +259,7 @@ template <typename ScalarType, size_t NUM_CHANNELS, bool IS_PACKED> struct Raste
         }
         if (mHasBackgrounds) {
             TORCH_CHECK_VALUE(mNumCameras == mBackgrounds.size(0), "Bad size for backgrounds");
-            TORCH_CHECK_VALUE(NUM_CHANNELS == mBackgrounds.size(1), "Bad size for backgrounds");
+            TORCH_CHECK_VALUE(numChannels == mBackgrounds.size(1), "Bad size for backgrounds");
         }
         if (mHasMasks) {
             TORCH_CHECK_VALUE(mNumCameras == mMasks.size(0), "Bad size for masks");

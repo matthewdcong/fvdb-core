@@ -72,7 +72,7 @@ insertionSortByDepth(uint32_t *depthIndices,
 
 // Structure to hold arguments and methods for the rasterize top contributing gaussian ids kernel
 template <typename ScalarType, bool IS_PACKED> struct RasterizeTopContributingGaussianIdsArgs {
-    using CommonArgs = RasterizeCommonArgs<ScalarType, 1, IS_PACKED>;
+    using CommonArgs = RasterizeCommonArgs<ScalarType, IS_PACKED>;
     CommonArgs commonArgs;
 
     uint32_t mNumDepthSamples;

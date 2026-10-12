@@ -13,6 +13,7 @@
 #include <fvdb/detail/utils/gsplat/CameraGradients.h>
 #include <fvdb/detail/utils/gsplat/Gaussian2D.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterize.cuh>
+#include <fvdb/detail/utils/gsplat/GaussianRasterizeKernel.cuh>
 
 #include <ATen/cuda/Atomic.cuh>
 #include <c10/core/DeviceType.h>
@@ -25,25 +26,16 @@
 namespace fvdb::detail::ops {
 namespace {
 
-template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
-struct RasterizeBackwardArgs {
-    using CommonArgs = RasterizeCommonArgs<ScalarType, NUM_CHANNELS, IS_PACKED>;
+// Channel counts specialize device methods, but not the argument layout or host setup. This
+// avoids repeating tensor preparation for every kernel while preserving compile-time loop bounds.
+template <typename ScalarType, bool IS_PACKED> struct RasterizeBackwardArgs {
+    using CommonArgs = RasterizeCommonArgs<ScalarType, IS_PACKED>;
     CommonArgs commonArgs;
 
     using vec2t          = typename CommonArgs::vec2t;
     using vec3t          = typename CommonArgs::vec3t;
     using VectorAccessor = typename CommonArgs::VectorAccessor;
     using ScalarAccessor = typename CommonArgs::ScalarAccessor;
-
-    constexpr static bool IS_CHUNKED = (NUM_CHANNELS != NUM_SHARED_CHANNELS);
-
-    // Preserve full unrolling for small feature vectors while bounding compiler work for the
-    // 512/513-channel kernels, as in the world-space rasterizer.
-    enum : size_t {
-        CHANNEL_UNROLL = NUM_CHANNELS <= 32 ? NUM_CHANNELS : 4,
-        SHARED_CHANNEL_UNROLL =
-            NUM_CHANNELS <= 32 || NUM_SHARED_CHANNELS <= 32 ? NUM_SHARED_CHANNELS : 4
-    };
 
     bool mAbsGrad;
 
@@ -149,13 +141,15 @@ struct RasterizeBackwardArgs {
                           "Bad size for outDLossDMeans2d");
         TORCH_CHECK_VALUE(3 == mOutDLossDConics.size(CommonArgs::NUM_OUTER_DIMS),
                           "Bad size for outDLossDConics");
-        TORCH_CHECK_VALUE(NUM_CHANNELS == mOutDLossDFeatures.size(CommonArgs::NUM_OUTER_DIMS),
+        TORCH_CHECK_VALUE(commonArgs.mFeatures.size(CommonArgs::NUM_OUTER_DIMS) ==
+                              mOutDLossDFeatures.size(CommonArgs::NUM_OUTER_DIMS),
                           "Bad size for outDLossDFeatures");
         TORCH_CHECK_VALUE(2 == mOutDLossDMeans2d.size(CommonArgs::NUM_OUTER_DIMS),
                           "Bad size for outDLossDMeans2d");
         TORCH_CHECK_VALUE(3 == mOutDLossDConics.size(CommonArgs::NUM_OUTER_DIMS),
                           "Bad size for outDLossDConics");
-        TORCH_CHECK_VALUE(NUM_CHANNELS == mOutDLossDFeatures.size(CommonArgs::NUM_OUTER_DIMS),
+        TORCH_CHECK_VALUE(commonArgs.mFeatures.size(CommonArgs::NUM_OUTER_DIMS) ==
+                              mOutDLossDFeatures.size(CommonArgs::NUM_OUTER_DIMS),
                           "Bad size for outDLossDFeatures");
 
         if constexpr (IS_PACKED) {
@@ -229,7 +223,8 @@ struct RasterizeBackwardArgs {
 
             TORCH_CHECK_VALUE(tensorSize == mDLossDRenderedFeatures.data().size(0),
                               "Bad size for dLossDRenderedFeatures");
-            TORCH_CHECK_VALUE(NUM_CHANNELS == mDLossDRenderedFeatures.data().size(1),
+            TORCH_CHECK_VALUE(commonArgs.mFeatures.size(CommonArgs::NUM_OUTER_DIMS) ==
+                                  mDLossDRenderedFeatures.data().size(1),
                               "Bad size for dLossDRenderedFeatures");
 
             TORCH_CHECK_VALUE(tensorSize == mDLossDRenderedAlphas.data().size(0),
@@ -272,6 +267,7 @@ struct RasterizeBackwardArgs {
     }
 
     // Fetch the features for a Gaussian into shared memory
+    template <typename Channels>
     inline __device__ void
     fetchGaussianFeatureIntoSharedMemory(const int32_t g,
                                          const size_t channelStart,
@@ -283,19 +279,19 @@ struct RasterizeBackwardArgs {
                 outFeatures[k] = featureAccessor[k + channelStart];
             }
         } else {
-            // colors: [C, N, NUM_CHANNELS]
-            // colors[c, n, k] = [c * N * NUM_CHANNELS + n * NUM_CHANNELS + k]
+            // colors: [C, N, Channels::COUNT]
+            // colors[c, n, k] = [c * N * Channels::COUNT + n * Channels::COUNT + k]
             // g = c * N + n
             const int32_t cid          = g / commonArgs.mNumGaussiansPerCamera;
             const int32_t gid          = g % commonArgs.mNumGaussiansPerCamera;
             const auto featureAccessor = commonArgs.mFeatures[cid][gid];
-            if constexpr (IS_CHUNKED) {
+            if constexpr (Channels::IS_CHUNKED) {
                 for (auto k = 0; k < numChannels; ++k) {
                     outFeatures[k] = featureAccessor[k + channelStart];
                 }
             } else {
-#pragma unroll CHANNEL_UNROLL
-                for (auto k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+                for (auto k = 0; k < Channels::COUNT; ++k) {
                     outFeatures[k] = featureAccessor[k];
                 }
             }
@@ -351,20 +347,21 @@ struct RasterizeBackwardArgs {
     /// for the features of this Gaussian
     /// @param channelStart The starting channel index for the features
     /// @param numChannels The number of channels to accumulate
+    template <typename Channels>
     inline __device__ void
     atomicAddFeatureGradientContributions(const int32_t g,
                                           const ScalarType *featureGradientContribution,
                                           const size_t channelStart,
                                           const size_t numChannels) {
         auto dLossDFeaturesGaussianPtr = getAccessorPointer<ScalarType>(mOutDLossDFeatures, g);
-        if constexpr (IS_CHUNKED) {
+        if constexpr (Channels::IS_CHUNKED) {
             for (uint32_t k = 0; k < numChannels; ++k) {
                 atomicAdd(dLossDFeaturesGaussianPtr + channelStart + k,
                           featureGradientContribution[k]);
             }
         } else {
-#pragma unroll CHANNEL_UNROLL
-            for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+            for (uint32_t k = 0; k < Channels::COUNT; ++k) {
                 atomicAdd(dLossDFeaturesGaussianPtr + k, featureGradientContribution[k]);
             }
         }
@@ -409,18 +406,19 @@ struct RasterizeBackwardArgs {
     /// @param fac The factor to multiply the features by
     /// @param numChannels The number of channels to accumulate
     /// @param outAccumFeatures The accumulated features
+    template <typename Channels>
     inline __device__ void
     accumulateFeaturesStep(const ScalarType *gaussianFeatures,
                            const ScalarType fac,
                            const size_t numChannels,
                            ScalarType *outAccumFeatures) const {
-        if constexpr (IS_CHUNKED) {
+        if constexpr (Channels::IS_CHUNKED) {
             for (uint32_t k = 0; k < numChannels; ++k) {
                 outAccumFeatures[k] += gaussianFeatures[k] * fac;
             }
         } else {
-#pragma unroll CHANNEL_UNROLL
-            for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+            for (uint32_t k = 0; k < Channels::COUNT; ++k) {
                 outAccumFeatures[k] += gaussianFeatures[k] * fac;
             }
         }
@@ -432,12 +430,13 @@ struct RasterizeBackwardArgs {
     /// @param dLossDRenderedFeatures The gradient of the loss with respect to the rendered features
     /// @param outFeatureGradientContribution The gradient contribution from this pixel to the
     /// gradient of the loss with respect to the features of this Gaussian
+    template <typename Channels>
     inline __device__ void
     calculateFeatureGradientContribution(const ScalarType fac,
                                          const ScalarType *dLossDRenderedFeatures,
                                          ScalarType *outFeatureGradientContribution) const {
-#pragma unroll SHARED_CHANNEL_UNROLL
-        for (uint32_t k = 0; k < NUM_SHARED_CHANNELS; ++k) {
+#pragma unroll Channels::SHARED_UNROLL
+        for (uint32_t k = 0; k < Channels::SHARED_COUNT; ++k) {
             outFeatureGradientContribution[k] = fac * dLossDRenderedFeatures[k];
         }
     }
@@ -448,6 +447,7 @@ struct RasterizeBackwardArgs {
     /// @param finalTransmittance The final transmittance for the current pixel
     /// @param oneOverOneMinusAlpha The inverse of (1 - alpha)
     /// @param accumTransmittance The accumulated transmittance for the current pixel
+    template <typename Channels>
     inline __device__ ScalarType
     calculateAlphaGradientContribution(const uint32_t cameraId,
                                        const ScalarType finalTransmittance,
@@ -460,15 +460,15 @@ struct RasterizeBackwardArgs {
                                        const size_t numChannels,
                                        const bool includeLastTerm) const {
         ScalarType alphaGradientContribution = ScalarType{0};
-        if constexpr (IS_CHUNKED) {
+        if constexpr (Channels::IS_CHUNKED) {
             for (uint32_t k = 0; k < numChannels; ++k) {
                 alphaGradientContribution += (gaussianFeature[k] * accumTransmittance -
                                               accumFeature[k] * oneOverOneMinusAlpha) *
                                              dLossDRenderedFeature[k];
             }
         } else {
-#pragma unroll CHANNEL_UNROLL
-            for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+            for (uint32_t k = 0; k < Channels::COUNT; ++k) {
                 alphaGradientContribution += (gaussianFeature[k] * accumTransmittance -
                                               accumFeature[k] * oneOverOneMinusAlpha) *
                                              dLossDRenderedFeature[k];
@@ -483,13 +483,13 @@ struct RasterizeBackwardArgs {
         // Factor in the contribution from the background to this pixel
         if (commonArgs.mHasBackgrounds) {
             ScalarType accum = ScalarType{0};
-            if constexpr (IS_CHUNKED) {
+            if constexpr (Channels::IS_CHUNKED) {
                 for (uint32_t k = 0; k < numChannels; ++k) {
                     accum += commonArgs.mBackgrounds[cameraId][k] * dLossDRenderedFeature[k];
                 }
             } else {
-#pragma unroll CHANNEL_UNROLL
-                for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
+#pragma unroll Channels::UNROLL
+                for (uint32_t k = 0; k < Channels::COUNT; ++k) {
                     accum += commonArgs.mBackgrounds[cameraId][k] * dLossDRenderedFeature[k];
                 }
             }
@@ -563,6 +563,7 @@ struct RasterizeBackwardArgs {
     /// @param outOpacityGradientContribution The gradient contribution from this pixel to the
     /// gradient of the loss with respect to the opacity of this Gaussian
     /// @return Whether this Gaussian contributes to this pixel
+    template <typename Channels>
     inline __device__ void
     calculateGradientContributions(const uint32_t cameraId,
                                    const Gaussian2D<ScalarType> &gaussian,
@@ -594,21 +595,21 @@ struct RasterizeBackwardArgs {
         // Update the contribution of this pixel to the color gradient of the
         // Gaussian
         const ScalarType fac = alpha * accumTransmittance;
-        calculateFeatureGradientContribution(
+        calculateFeatureGradientContribution<Channels>(
             fac, dLossDRenderedFeature, outFeatureGradientContribution);
 
         // Contribution from this pixel to the alpha value for this Gaussian
         const ScalarType alphaGradientContribution =
-            calculateAlphaGradientContribution(cameraId,
-                                               finalTransmittance,
-                                               oneOverOneMinusAlpha,
-                                               accumTransmittance,
-                                               accumFeature,
-                                               gaussianFeature,
-                                               dLossDRenderedFeature,
-                                               dLossDRenderedAlpha,
-                                               numChannels,
-                                               calculateMeansConicsAndOpacitiesGradient);
+            calculateAlphaGradientContribution<Channels>(cameraId,
+                                                         finalTransmittance,
+                                                         oneOverOneMinusAlpha,
+                                                         accumTransmittance,
+                                                         accumFeature,
+                                                         gaussianFeature,
+                                                         dLossDRenderedFeature,
+                                                         dLossDRenderedAlpha,
+                                                         numChannels,
+                                                         calculateMeansConicsAndOpacitiesGradient);
 
         if (opac * expMinusSigma <= commonArgs.ALPHA_THRESHOLD) {
             calculateMeansConicsAndOpacitiesGradientContribution(opac,
@@ -622,7 +623,7 @@ struct RasterizeBackwardArgs {
                                                                  outOpacityGradientContribution);
         }
 
-        accumulateFeaturesStep(gaussianFeature, fac, numChannels, accumFeature);
+        accumulateFeaturesStep<Channels>(gaussianFeature, fac, numChannels, accumFeature);
     }
 
     /// @brief Compute the gradient of the loss with respect to the parameters of the Gaussians
@@ -632,6 +633,7 @@ struct RasterizeBackwardArgs {
     /// @param i The row index of the pixel
     /// @param j The column index of the pixel
     /// @param firstGaussianIdInBlock The ID of the first Gaussian in the block
+    template <typename Channels>
     inline __device__ void
     volumeRenderTileBackward(const uint32_t cameraId,
                              const uint32_t row,
@@ -684,21 +686,19 @@ struct RasterizeBackwardArgs {
         const int64_t numIntersections = lastGaussianIdInBlock - firstGaussianIdInBlock;
         const int64_t numBatches       = (numIntersections + blockSize - 1) / blockSize;
 
-        constexpr size_t NUM_CHUNKS =
-            (NUM_CHANNELS + NUM_SHARED_CHANNELS - 1) / NUM_SHARED_CHANNELS;
-        for (size_t chunk = 0; chunk < NUM_CHUNKS; chunk += 1) {
-            const size_t channelStart = chunk * NUM_SHARED_CHANNELS;
-            const size_t numChannels  = min(NUM_CHANNELS - channelStart, NUM_SHARED_CHANNELS);
-            const bool isLastChunk    = chunk == (NUM_CHUNKS - 1);
+        for (size_t chunk = 0; chunk < Channels::CHUNK_COUNT; chunk += 1) {
+            const size_t channelStart = chunk * Channels::SHARED_COUNT;
+            const size_t numChannels  = min(Channels::COUNT - channelStart, Channels::SHARED_COUNT);
+            const bool isLastChunk    = chunk == (Channels::CHUNK_COUNT - 1);
 
             ScalarType accumTransmittance = finalTransmittance;
 
             // the contribution from gaussians behind the current one
-            ScalarType accumFeature[NUM_SHARED_CHANNELS] = {ScalarType(0)};
+            ScalarType accumFeature[Channels::SHARED_COUNT] = {ScalarType(0)};
 
             // Gradient of the loss with respect to the color output of the forward pass at this
             // pixel
-            ScalarType dLossDRenderedFeature[NUM_SHARED_CHANNELS];
+            ScalarType dLossDRenderedFeature[Channels::SHARED_COUNT];
             if (pixelIsActive) {
                 for (auto k = 0; k < numChannels; ++k) {
                     dLossDRenderedFeature[k] = readDLossDRenderedFeature(pixIdx, channelStart + k);
@@ -708,7 +708,7 @@ struct RasterizeBackwardArgs {
                     dLossDRenderedFeature[k] = ScalarType{0};
                 }
             }
-            for (auto k = numChannels; k < NUM_SHARED_CHANNELS; ++k) {
+            for (auto k = numChannels; k < Channels::SHARED_COUNT; ++k) {
                 dLossDRenderedFeature[k] = ScalarType{0};
             }
 
@@ -733,8 +733,10 @@ struct RasterizeBackwardArgs {
                     // position, so gaussianIsValid will be false and features are never
                     // read in the rendering loop.
                     if (sharedGaussians[tidx].opacity >= 1.f / 255.f) {
-                        ScalarType *feature = &sharedGaussianFeatures[tidx * NUM_SHARED_CHANNELS];
-                        fetchGaussianFeatureIntoSharedMemory(g, channelStart, numChannels, feature);
+                        ScalarType *feature =
+                            &sharedGaussianFeatures[tidx * Channels::SHARED_COUNT];
+                        fetchGaussianFeatureIntoSharedMemory<Channels>(
+                            g, channelStart, numChannels, feature);
                     }
                 }
 
@@ -779,20 +781,21 @@ struct RasterizeBackwardArgs {
 
                     // How much each pixel contributes to the gradient of the parameters for
                     // this gaussian Initialize to 0 and only set if this pixel is valid
-                    ScalarType featureGradientContribution[NUM_SHARED_CHANNELS] = {ScalarType{0}};
+                    ScalarType featureGradientContribution[Channels::SHARED_COUNT] = {
+                        ScalarType{0}};
                     vec3t conicGradientContribution = {ScalarType{0}, ScalarType{0}, ScalarType{0}};
                     vec2t mean2dGradientContribution       = {ScalarType{0}, ScalarType{0}};
                     vec2t mean2dAbsGradientContribution    = {ScalarType{0}, ScalarType{0}};
                     ScalarType opacityGradientContribution = ScalarType{0};
 
                     if (valid) {
-                        calculateGradientContributions(
+                        calculateGradientContributions<Channels>(
                             cameraId,
                             sharedGaussians[t],
                             delta,
                             expMinusSigma,
                             alpha,
-                            &sharedGaussianFeatures[t * NUM_SHARED_CHANNELS],
+                            &sharedGaussianFeatures[t * Channels::SHARED_COUNT],
                             dLossDRenderedFeature,
                             dLossDRenderedAlpha,
                             px,
@@ -811,11 +814,11 @@ struct RasterizeBackwardArgs {
 
                     // Accumulate the gradient contribution to this Gaussian from every
                     // pixel in the block
-                    if constexpr (IS_CHUNKED || NUM_SHARED_CHANNELS > 32) {
+                    if constexpr (Channels::IS_CHUNKED || Channels::SHARED_COUNT > 32) {
                         warpSumMut<decltype(warp), ScalarType>(
                             featureGradientContribution, numChannels, warp);
                     } else {
-                        warpSumMut<NUM_SHARED_CHANNELS, decltype(warp), ScalarType>(
+                        warpSumMut<Channels::SHARED_COUNT, decltype(warp), ScalarType>(
                             featureGradientContribution, warp);
                     }
 
@@ -832,10 +835,10 @@ struct RasterizeBackwardArgs {
                     if (warp.thread_rank() == 0) {
                         const int32_t outputGaussianId =
                             sharedGaussians[t].id - outputGaussianOffset;
-                        atomicAddFeatureGradientContributions(outputGaussianId,
-                                                              featureGradientContribution,
-                                                              channelStart,
-                                                              numChannels);
+                        atomicAddFeatureGradientContributions<Channels>(outputGaussianId,
+                                                                        featureGradientContribution,
+                                                                        channelStart,
+                                                                        numChannels);
                         atomicAddMeans2dConicsAndOpacitiesGradientContributions(
                             outputGaussianId,
                             conicGradientContribution,
@@ -857,8 +860,9 @@ struct RasterizeBackwardArgs {
 /// @param IS_PACKED Whether the features are packed (i.e. linearized across the outer dimensions)
 template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
 __global__ void
-rasterizeGaussiansBackward(
-    RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args) {
+rasterizeGaussiansBackward(RasterizeBackwardArgs<ScalarType, IS_PACKED> args) {
+    using Channels = RasterizeChannels<NUM_CHANNELS, NUM_SHARED_CHANNELS>;
+
     auto &commonArgs = args.commonArgs;
 
     int32_t cameraId;
@@ -892,14 +896,14 @@ rasterizeGaussiansBackward(
 
     // Compute the backward pass for the current tile starting at pixel (i, j)
     // and containing Gaussians with ids in [firstGaussianIdInBlock, lastGaussianIdInBlock)
-    args.volumeRenderTileBackward(cameraId,
-                                  row,
-                                  col,
-                                  firstGaussianIdInBlock,
-                                  lastGaussianIdInBlock,
-                                  blockDim.x * blockDim.y,
-                                  pixelInImage,
-                                  activePixelIndex);
+    args.template volumeRenderTileBackward<Channels>(cameraId,
+                                                     row,
+                                                     col,
+                                                     firstGaussianIdInBlock,
+                                                     lastGaussianIdInBlock,
+                                                     blockDim.x * blockDim.y,
+                                                     pixelInImage,
+                                                     activePixelIndex);
 }
 
 /// @brief Get the shared memory requirements for the backward pass kernel
@@ -913,9 +917,11 @@ getSharedMemRequirements(const size_t numColorChannels, const size_t tileSize) {
            (sizeof(Gaussian2D<ScalarType>) + numColorChannels * sizeof(ScalarType));
 }
 
-template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
+template <typename ScalarType, bool IS_PACKED>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-callRasterizeBackwardWithTemplatedSharedChannels(
+callRasterizeBackwardWithSharedChannels(
+    RasterizeKernel<RasterizeBackwardArgs<ScalarType, IS_PACKED>> kernel,
+    const size_t numSharedChannels,
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,                    // [C, N, 3] or [nnz, 3]
     const torch::Tensor &features,                  // [C, N, 3] or [nnz, 3]
@@ -929,7 +935,7 @@ callRasterizeBackwardWithTemplatedSharedChannels(
     const fvdb::JaggedTensor &renderedAlphas,       // {C, [AP, 1]} or {1, [C, H, W, 1]}
     const fvdb::JaggedTensor &lastGaussianIds,      // {C, [AP]} or {1, [C, H, W]}
     const fvdb::JaggedTensor
-        &dLossDRenderedFeatures, // {C, [AP, NUM_CHANNELS]} or {1, [C, H, W, NUM_CHANNELS]}
+        &dLossDRenderedFeatures, // {C, [AP, channels]} or {1, [C, H, W, channels]}
     const fvdb::JaggedTensor &dLossDRenderedAlphas, // {C, [AP, 1]} or {1, [C, H, W, 1]}
     bool absGrad, // True if we are computing the gradient of the absolute gradient of the means2d
     at::cuda::CUDAStream stream,
@@ -973,14 +979,15 @@ callRasterizeBackwardWithTemplatedSharedChannels(
             return std::make_tuple(
                 fvdb::JaggedTensor(renderedAlphas.jdata().view({C * HW, 1})),
                 fvdb::JaggedTensor(lastGaussianIds.jdata().view({C * HW})),
-                fvdb::JaggedTensor(dLossDRenderedFeatures.jdata().view({C * HW, NUM_CHANNELS})),
+                fvdb::JaggedTensor(
+                    dLossDRenderedFeatures.jdata().view({C * HW, features.size(-1)})),
                 fvdb::JaggedTensor(dLossDRenderedAlphas.jdata().view({C * HW, 1})));
         }
         return std::make_tuple(
             renderedAlphas, lastGaussianIds, dLossDRenderedFeatures, dLossDRenderedAlphas);
     }();
 
-    RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
+    RasterizeBackwardArgs<ScalarType, IS_PACKED> args(
         means2d,
         conics,
         opacities,
@@ -1006,22 +1013,23 @@ callRasterizeBackwardWithTemplatedSharedChannels(
         tilePixelCumsum,
         pixelMap);
 
-    const size_t numChannels =
-        (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
+    const size_t numChannels   = (numSharedChannels == static_cast<size_t>(features.size(-1)))
+                                     ? features.size(-1)
+                                     : numSharedChannels + 1;
     const size_t sharedMemSize = getSharedMemRequirements<ScalarType>(numChannels, tileSize);
 
-    if (cudaFuncSetAttribute(
-            rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            sharedMemSize) != cudaSuccess) {
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize) !=
+        cudaSuccess) {
         AT_ERROR("Failed to set maximum shared memory size (requested ",
                  sharedMemSize,
                  " bytes), try lowering tileSize.");
     }
-    rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>
-        <<<args.commonArgs.getGridDim(), args.commonArgs.getBlockDim(), sharedMemSize, stream>>>(
-            args);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    launchRasterizeKernel(kernel,
+                          args.commonArgs.getGridDim(),
+                          args.commonArgs.getBlockDim(),
+                          args,
+                          sharedMemSize,
+                          stream);
     return std::make_tuple(outDLossDMeans2dAbs,
                            outDLossDMeans2d,
                            outDLossDConics,
@@ -1056,106 +1064,15 @@ callRasterizeBackwardWithCorrectSharedChannels(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
     auto callWithSharedChannels = [&](size_t numSharedChannels) {
+        RasterizeKernel<RasterizeBackwardArgs<ScalarType, IS_PACKED>> kernel;
         if (numSharedChannels == NUM_CHANNELS) {
-            return callRasterizeBackwardWithTemplatedSharedChannels<ScalarType,
-                                                                    NUM_CHANNELS,
-                                                                    NUM_CHANNELS,
-                                                                    IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                renderedAlphas,
-                lastGaussianIds,
-                dLossDRenderedFeatures,
-                dLossDRenderedAlphas,
-                absGrad,
-                stream,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_CHANNELS, IS_PACKED>;
         } else if (numSharedChannels == 64) {
-            return callRasterizeBackwardWithTemplatedSharedChannels<ScalarType,
-                                                                    NUM_CHANNELS,
-                                                                    64,
-                                                                    IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                renderedAlphas,
-                lastGaussianIds,
-                dLossDRenderedFeatures,
-                dLossDRenderedAlphas,
-                absGrad,
-                stream,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, 64, IS_PACKED>;
         } else if (numSharedChannels == 32) {
-            return callRasterizeBackwardWithTemplatedSharedChannels<ScalarType,
-                                                                    NUM_CHANNELS,
-                                                                    32,
-                                                                    IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                renderedAlphas,
-                lastGaussianIds,
-                dLossDRenderedFeatures,
-                dLossDRenderedAlphas,
-                absGrad,
-                stream,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, 32, IS_PACKED>;
         } else if (numSharedChannels == 16) {
-            return callRasterizeBackwardWithTemplatedSharedChannels<ScalarType,
-                                                                    NUM_CHANNELS,
-                                                                    16,
-                                                                    IS_PACKED>(
-                means2d,
-                conics,
-                features,
-                opacities,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                tileOffsets,
-                tileGaussianIds,
-                renderedAlphas,
-                lastGaussianIds,
-                dLossDRenderedFeatures,
-                dLossDRenderedAlphas,
-                absGrad,
-                stream,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            kernel = rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, 16, IS_PACKED>;
         } else {
             if (numSharedSharedChannelsOverride > 0) {
                 AT_ERROR("Invalid numSharedChannelsOverride. Must be 64, 32, or 16.");
@@ -1163,6 +1080,29 @@ callRasterizeBackwardWithCorrectSharedChannels(
                 AT_ERROR("Failed to set maximum shared memory size");
             }
         }
+        return callRasterizeBackwardWithSharedChannels<ScalarType, IS_PACKED>(
+            kernel,
+            numSharedChannels,
+            means2d,
+            conics,
+            features,
+            opacities,
+            backgrounds,
+            masks,
+            renderWindow,
+            tileSize,
+            tileOffsets,
+            tileGaussianIds,
+            renderedAlphas,
+            lastGaussianIds,
+            dLossDRenderedFeatures,
+            dLossDRenderedAlphas,
+            absGrad,
+            stream,
+            activeTiles,
+            tilePixelMask,
+            tilePixelCumsum,
+            pixelMap);
     };
 
     if (numSharedSharedChannelsOverride > 0) {
@@ -1209,9 +1149,11 @@ struct ScreenSpaceGradients {
     }
 };
 
-template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
+template <typename ScalarType, bool IS_PACKED>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 callRasterizeBackwardPrivateUse1(
+    RasterizeKernel<RasterizeBackwardArgs<ScalarType, IS_PACKED>> kernel,
+    const size_t numSharedChannels,
     const torch::Tensor &means2d,                   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,                    // [C, N, 3] or [nnz, 3]
     const torch::Tensor &features,                  // [C, N, 3] or [nnz, 3]
@@ -1225,7 +1167,7 @@ callRasterizeBackwardPrivateUse1(
     const fvdb::JaggedTensor &renderedAlphas,       // {C, [AP, 1]} or {1, [C, H, W, 1]}
     const fvdb::JaggedTensor &lastGaussianIds,      // {C, [AP]} or {1, [C, H, W]}
     const fvdb::JaggedTensor
-        &dLossDRenderedFeatures, // {C, [AP, NUM_CHANNELS]} or {1, [C, H, W, NUM_CHANNELS]}
+        &dLossDRenderedFeatures, // {C, [AP, channels]} or {1, [C, H, W, channels]}
     const fvdb::JaggedTensor &dLossDRenderedAlphas, // {C, [AP, 1]} or {1, [C, H, W, 1]}
     bool absGrad, // True if we are computing the gradient of the absolute gradient of the means2d
     const std::optional<torch::Tensor> &activeTiles     = std::nullopt,
@@ -1271,7 +1213,8 @@ callRasterizeBackwardPrivateUse1(
             return std::make_tuple(
                 fvdb::JaggedTensor(renderedAlphas.jdata().view({C * HW, 1})),
                 fvdb::JaggedTensor(lastGaussianIds.jdata().view({C * HW})),
-                fvdb::JaggedTensor(dLossDRenderedFeatures.jdata().view({C * HW, NUM_CHANNELS})),
+                fvdb::JaggedTensor(
+                    dLossDRenderedFeatures.jdata().view({C * HW, features.size(-1)})),
                 fvdb::JaggedTensor(dLossDRenderedAlphas.jdata().view({C * HW, 1})));
         }
         return std::make_tuple(
@@ -1379,41 +1322,38 @@ callRasterizeBackwardPrivateUse1(
         auto launch = [&](uint32_t deviceTileOffset,
                           uint32_t deviceTileCount,
                           const ScreenSpaceGradients &gradients) {
-            RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
-                means2d,
-                conics,
-                opacities,
-                features,
-                backgrounds,
-                masks,
-                renderWindow,
-                tileSize,
-                deviceTileOffset,
-                tileOffsets,
-                tileGaussianIds,
-                reshapedRenderedAlphas,
-                reshapedLastGaussianIds,
-                reshapedDLossDRenderedFeatures,
-                reshapedDLossDRenderedAlphas,
-                gradients.means2d,
-                gradients.conics,
-                gradients.features,
-                gradients.opacities,
-                gradients.means2dAbs,
-                activeTiles,
-                tilePixelMask,
-                tilePixelCumsum,
-                pixelMap);
+            RasterizeBackwardArgs<ScalarType, IS_PACKED> args(means2d,
+                                                              conics,
+                                                              opacities,
+                                                              features,
+                                                              backgrounds,
+                                                              masks,
+                                                              renderWindow,
+                                                              tileSize,
+                                                              deviceTileOffset,
+                                                              tileOffsets,
+                                                              tileGaussianIds,
+                                                              reshapedRenderedAlphas,
+                                                              reshapedLastGaussianIds,
+                                                              reshapedDLossDRenderedFeatures,
+                                                              reshapedDLossDRenderedAlphas,
+                                                              gradients.means2d,
+                                                              gradients.conics,
+                                                              gradients.features,
+                                                              gradients.opacities,
+                                                              gradients.means2dAbs,
+                                                              activeTiles,
+                                                              tilePixelMask,
+                                                              tilePixelCumsum,
+                                                              pixelMap);
 
-            const size_t numChannels =
-                (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
+            const size_t numChannels = (numSharedChannels == static_cast<size_t>(features.size(-1)))
+                                           ? features.size(-1)
+                                           : numSharedChannels + 1;
             const size_t sharedMemSize =
                 getSharedMemRequirements<ScalarType>(numChannels, tileSize);
 
-            if (cudaFuncSetAttribute(rasterizeGaussiansBackward<ScalarType,
-                                                                NUM_CHANNELS,
-                                                                NUM_SHARED_CHANNELS,
-                                                                IS_PACKED>,
+            if (cudaFuncSetAttribute(kernel,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      sharedMemSize) != cudaSuccess) {
                 AT_ERROR("Failed to set maximum shared memory size (requested ",
@@ -1424,9 +1364,7 @@ callRasterizeBackwardPrivateUse1(
             const dim3 blockDim = {tileSize, tileSize, 1};
             const dim3 gridDim  = {deviceTileCount, 1, 1};
 
-            rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>
-                <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            launchRasterizeKernel(kernel, gridDim, blockDim, args, sharedMemSize, stream);
         };
 
         if (cameraGradients.has_value()) {
@@ -1685,41 +1623,47 @@ dispatchRasterizeScreenSpaceGaussiansBwd<torch::kPrivateUse1>(
     uint32_t colorDim   = features.size(-1);
     const bool isPacked = means2d.dim() == 2;
 
-#define CALL_BWD_PRIVATEUSE1(N)                                                                 \
-    case N: {                                                                                   \
-        if (isPacked) {                                                                         \
-            return callRasterizeBackwardPrivateUse1<float, N, N, true>(means2d,                 \
-                                                                       conics,                  \
-                                                                       features,                \
-                                                                       opacities,               \
-                                                                       backgrounds,             \
-                                                                       masks,                   \
-                                                                       renderWindow,            \
-                                                                       tileSize,                \
-                                                                       tileOffsets,             \
-                                                                       tileGaussianIds,         \
-                                                                       renderedAlphas,          \
-                                                                       lastGaussianIds,         \
-                                                                       dLossDRenderedFeatures,  \
-                                                                       dLossDRenderedAlphas,    \
-                                                                       absGrad);                \
-        } else {                                                                                \
-            return callRasterizeBackwardPrivateUse1<float, N, N, false>(means2d,                \
-                                                                        conics,                 \
-                                                                        features,               \
-                                                                        opacities,              \
-                                                                        backgrounds,            \
-                                                                        masks,                  \
-                                                                        renderWindow,           \
-                                                                        tileSize,               \
-                                                                        tileOffsets,            \
-                                                                        tileGaussianIds,        \
-                                                                        renderedAlphas,         \
-                                                                        lastGaussianIds,        \
-                                                                        dLossDRenderedFeatures, \
-                                                                        dLossDRenderedAlphas,   \
-                                                                        absGrad);               \
-        }                                                                                       \
+#define CALL_BWD_PRIVATEUSE1(N)                                    \
+    case N: {                                                      \
+        if (isPacked) {                                            \
+            return callRasterizeBackwardPrivateUse1<float, true>(  \
+                rasterizeGaussiansBackward<float, N, N, true>,     \
+                N,                                                 \
+                means2d,                                           \
+                conics,                                            \
+                features,                                          \
+                opacities,                                         \
+                backgrounds,                                       \
+                masks,                                             \
+                renderWindow,                                      \
+                tileSize,                                          \
+                tileOffsets,                                       \
+                tileGaussianIds,                                   \
+                renderedAlphas,                                    \
+                lastGaussianIds,                                   \
+                dLossDRenderedFeatures,                            \
+                dLossDRenderedAlphas,                              \
+                absGrad);                                          \
+        } else {                                                   \
+            return callRasterizeBackwardPrivateUse1<float, false>( \
+                rasterizeGaussiansBackward<float, N, N, false>,    \
+                N,                                                 \
+                means2d,                                           \
+                conics,                                            \
+                features,                                          \
+                opacities,                                         \
+                backgrounds,                                       \
+                masks,                                             \
+                renderWindow,                                      \
+                tileSize,                                          \
+                tileOffsets,                                       \
+                tileGaussianIds,                                   \
+                renderedAlphas,                                    \
+                lastGaussianIds,                                   \
+                dLossDRenderedFeatures,                            \
+                dLossDRenderedAlphas,                              \
+                absGrad);                                          \
+        }                                                          \
     }
 
     switch (colorDim) {

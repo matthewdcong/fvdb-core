@@ -7,6 +7,7 @@
 #include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterizeFromWorld.cuh>
+#include <fvdb/detail/utils/gsplat/GaussianRasterizeKernel.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterizeOptionalInputs.h>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -23,14 +24,14 @@ namespace cg = cooperative_groups;
 
 namespace {
 
-template <uint32_t NUM_CHANNELS> struct SharedGaussian {
+struct SharedGaussian {
     int32_t id;                       // flattened id in [0, C*N)
     nanovdb::math::Vec3<float> mean;  // world mean
     nanovdb::math::Mat3<float> isclR; // S^{-1} R^T
     float opacity;
 };
 
-template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwardArgs {
+template <typename Camera> struct RasterizeFromWorldForwardArgs {
     RasterizeFromWorldCommonArgs commonArgs;
     Camera camera;
     uint32_t blockOffset;
@@ -38,12 +39,10 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
     fvdb::TorchRAcc64<float, 4> outAlphas;    // [C,H,W,1]
     fvdb::TorchRAcc64<int32_t, 3> outLastIds; // [C,H,W]
 
+    template <uint32_t NUM_CHANNELS>
     inline __device__ void
     volumeRenderTileForward() const {
-        // Fully expanding every channel operation makes the 512/513-channel kernels prohibitively
-        // expensive for ptxas to optimize, especially for SM 120. Preserve full unrolling for the
-        // smaller kernels while keeping the generated code bounded for larger channel counts.
-        constexpr uint32_t CHANNEL_UNROLL = NUM_CHANNELS <= 32 ? 32 : 4;
+        using Channels = RasterizeChannels<NUM_CHANNELS>;
 
         const uint32_t blockSize = blockDim.x * blockDim.y;
         auto block               = cg::this_thread_block();
@@ -70,7 +69,7 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
             if (inside) {
                 outAlphaPtr[0]  = 0.0f;
                 outLastIdPtr[0] = -1;
-#pragma unroll CHANNEL_UNROLL
+#pragma unroll Channels::UNROLL
                 for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                     outFeaturesPtr[k * outFeatures.stride(3)] = common.backgroundValue(camId, k);
                 }
@@ -101,7 +100,7 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
                 // alpha=0, output background if provided else 0.
                 outAlphaPtr[0]  = 0.0f;
                 outLastIdPtr[0] = -1;
-#pragma unroll CHANNEL_UNROLL
+#pragma unroll Channels::UNROLL
                 for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                     outFeaturesPtr[k * outFeatures.stride(3)] = common.backgroundValue(camId, k);
                 }
@@ -112,16 +111,15 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
         // Shared memory for batched gaussians (after camera-op shared state).
         uintptr_t gaussAddr = smemAddr + cameraLocal.numSharedMemBytes();
         gaussAddr           = alignUpAddress(gaussAddr, alignof(int32_t));
-        int32_t *idBatch    = reinterpret_cast<int32_t *>(gaussAddr); // [blockSize]
+        int32_t *idBatch    = reinterpret_cast<int32_t *>(gaussAddr);     // [blockSize]
         gaussAddr += static_cast<size_t>(blockSize) * sizeof(int32_t);
-        gaussAddr = alignUpAddress(gaussAddr, alignof(SharedGaussian<NUM_CHANNELS>));
-        auto *gaussBatch =
-            reinterpret_cast<SharedGaussian<NUM_CHANNELS> *>(gaussAddr); // [blockSize]
+        gaussAddr        = alignUpAddress(gaussAddr, alignof(SharedGaussian));
+        auto *gaussBatch = reinterpret_cast<SharedGaussian *>(gaussAddr); // [blockSize]
 
         float transmittance            = 1.0f;
         int32_t lastIntersectionOffset = -1;
         float pixOut[NUM_CHANNELS];
-#pragma unroll CHANNEL_UNROLL
+#pragma unroll Channels::UNROLL
         for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
             pixOut[k] = 0.f;
         }
@@ -168,7 +166,7 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
             const uint32_t batchSize =
                 static_cast<uint32_t>(remaining < blockSize ? remaining : blockSize);
             for (uint32_t t = 0; (t < batchSize) && !done; ++t) {
-                const SharedGaussian<NUM_CHANNELS> g = gaussBatch[t];
+                const SharedGaussian g = gaussBatch[t];
                 // 3DGS ray-ellipsoid visibility in "whitened" coordinates (see 3D-GUT paper
                 // Fig. 11). gro   = S^{-1} R^T (o - μ) grd   = normalize( S^{-1} R^T d ) gcrod =
                 // grd × gro  (distance proxy to principal axis in whitened space)
@@ -191,7 +189,7 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
                 const float contrib = alpha * transmittance;
                 const int32_t cid   = g.id / (int32_t)common.means.size(0);
                 const int32_t gid   = g.id % (int32_t)common.means.size(0);
-#pragma unroll CHANNEL_UNROLL
+#pragma unroll Channels::UNROLL
                 for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
                     pixOut[k] += common.features[cid][gid][k] * contrib;
                 }
@@ -206,7 +204,7 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
 
         outAlphaPtr[0]  = 1.0f - transmittance;
         outLastIdPtr[0] = lastIntersectionOffset;
-#pragma unroll CHANNEL_UNROLL
+#pragma unroll Channels::UNROLL
         for (uint32_t k = 0; k < NUM_CHANNELS; ++k) {
             outFeaturesPtr[k * outFeatures.stride(3)] =
                 pixOut[k] + transmittance * common.backgroundValue(camId, k);
@@ -216,11 +214,13 @@ template <uint32_t NUM_CHANNELS, typename Camera> struct RasterizeFromWorldForwa
 
 template <uint32_t NUM_CHANNELS, typename Camera>
 __global__ void
-rasterizeGaussiansFromWorld(const RasterizeFromWorldForwardArgs<NUM_CHANNELS, Camera> args) {
-    args.volumeRenderTileForward();
+rasterizeGaussiansFromWorld(const RasterizeFromWorldForwardArgs<Camera> args) {
+    args.template volumeRenderTileForward<NUM_CHANNELS>();
 }
 
-template <uint32_t NUM_CHANNELS, typename Camera>
+// Only the device kernel depends on the channel count. Pass its handle through the host launch
+// path so tensor setup and multi-GPU scheduling are compiled once per camera type.
+template <typename Camera>
 void
 launchForwardKernel(const torch::Tensor &means,
                     const torch::Tensor &quats,
@@ -242,7 +242,8 @@ launchForwardKernel(const torch::Tensor &means,
                     const torch::Tensor &outLastIds,
                     const uint32_t blockOffset,
                     const uint32_t blockCount,
-                    const cudaStream_t stream) {
+                    const cudaStream_t stream,
+                    RasterizeKernel<RasterizeFromWorldForwardArgs<Camera>> kernel) {
     const int64_t C = features.size(0);
 
     const uint32_t tileExtentW = (imageWidth + tileSize - 1) / tileSize;
@@ -260,7 +261,7 @@ launchForwardKernel(const torch::Tensor &means,
         tileSize,
         tileExtentW,
         tileExtentH,
-        NUM_CHANNELS,
+        static_cast<uint32_t>(features.size(2)),
         totalIntersections,
         tileOffsets.packed_accessor64<int64_t, 3, torch::RestrictPtrTraits>(),
         tileGaussianIds.packed_accessor64<int32_t, 1, torch::RestrictPtrTraits>(),
@@ -272,12 +273,18 @@ launchForwardKernel(const torch::Tensor &means,
         features.packed_accessor64<float, 3, torch::RestrictPtrTraits>(),
         opacities.packed_accessor64<float, 2, torch::RestrictPtrTraits>()};
 
-    const PreparedRasterOptionalInputs opt = prepareRasterOptionalInputs(
-        features, C, tileExtentH, tileExtentW, (int64_t)NUM_CHANNELS, backgrounds, masks);
+    const PreparedRasterOptionalInputs opt =
+        prepareRasterOptionalInputs(features,
+                                    C,
+                                    tileExtentH,
+                                    tileExtentW,
+                                    (int64_t) static_cast<uint32_t>(features.size(2)),
+                                    backgrounds,
+                                    masks);
     commonArgs.backgrounds = opt.backgrounds;
     commonArgs.masks       = opt.masks;
 
-    RasterizeFromWorldForwardArgs<NUM_CHANNELS, Camera> args{
+    RasterizeFromWorldForwardArgs<Camera> args{
         commonArgs,
         camera,
         blockOffset,
@@ -288,23 +295,19 @@ launchForwardKernel(const torch::Tensor &means,
     const size_t blockSize = (size_t)tileSize * (size_t)tileSize;
     size_t sharedMem       = (alignof(nanovdb::math::Mat3<float>) - 1) + camera.numSharedMemBytes();
     sharedMem += (alignof(int32_t) - 1) + blockSize * sizeof(int32_t);
-    sharedMem += (alignof(SharedGaussian<NUM_CHANNELS>) - 1) +
-                 blockSize * sizeof(SharedGaussian<NUM_CHANNELS>);
+    sharedMem += (alignof(SharedGaussian) - 1) + blockSize * sizeof(SharedGaussian);
 
-    if (cudaFuncSetAttribute(rasterizeGaussiansFromWorld<NUM_CHANNELS, Camera>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             sharedMem) != cudaSuccess) {
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMem) !=
+        cudaSuccess) {
         AT_ERROR("Failed to set maximum shared memory size (requested ",
                  sharedMem,
                  " bytes), try lowering tile size or camera batch size.");
     }
 
-    rasterizeGaussiansFromWorld<NUM_CHANNELS, Camera>
-        <<<gridDim, blockDim, sharedMem, stream>>>(args);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    launchRasterizeKernel(kernel, gridDim, blockDim, args, sharedMem, stream);
 }
 
-template <uint32_t NUM_CHANNELS, typename Camera>
+template <typename Camera>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 launchForwardCUDA(const torch::Tensor &means,
                   const torch::Tensor &quats,
@@ -320,11 +323,12 @@ launchForwardCUDA(const torch::Tensor &means,
                   const torch::Tensor &tileOffsets,
                   const torch::Tensor &tileGaussianIds,
                   const at::optional<torch::Tensor> &backgrounds,
-                  const at::optional<torch::Tensor> &masks) {
+                  const at::optional<torch::Tensor> &masks,
+                  RasterizeKernel<RasterizeFromWorldForwardArgs<Camera>> kernel) {
     const int64_t C = features.size(0);
     const auto opts = features.options();
     torch::Tensor outFeatures =
-        torch::zeros({C, (int64_t)imageHeight, (int64_t)imageWidth, (int64_t)NUM_CHANNELS}, opts);
+        torch::zeros({C, (int64_t)imageHeight, (int64_t)imageWidth, features.size(2)}, opts);
     torch::Tensor outAlphas = torch::zeros({C, (int64_t)imageHeight, (int64_t)imageWidth, 1}, opts);
     torch::Tensor outLastIds =
         torch::zeros({C, (int64_t)imageHeight, (int64_t)imageWidth},
@@ -335,32 +339,33 @@ launchForwardCUDA(const torch::Tensor &means,
     const uint32_t blockCount  = C * tileExtentH * tileExtentW;
     if (blockCount > 0) {
         auto stream = at::cuda::getCurrentCUDAStream(means.device().index());
-        launchForwardKernel<NUM_CHANNELS, Camera>(means,
-                                                  quats,
-                                                  logScales,
-                                                  features,
-                                                  opacities,
-                                                  camera,
-                                                  imageWidth,
-                                                  imageHeight,
-                                                  imageOriginW,
-                                                  imageOriginH,
-                                                  tileSize,
-                                                  tileOffsets,
-                                                  tileGaussianIds,
-                                                  backgrounds,
-                                                  masks,
-                                                  outFeatures,
-                                                  outAlphas,
-                                                  outLastIds,
-                                                  0,
-                                                  blockCount,
-                                                  stream);
+        launchForwardKernel(means,
+                            quats,
+                            logScales,
+                            features,
+                            opacities,
+                            camera,
+                            imageWidth,
+                            imageHeight,
+                            imageOriginW,
+                            imageOriginH,
+                            tileSize,
+                            tileOffsets,
+                            tileGaussianIds,
+                            backgrounds,
+                            masks,
+                            outFeatures,
+                            outAlphas,
+                            outLastIds,
+                            0,
+                            blockCount,
+                            stream,
+                            kernel);
     }
     return {outFeatures, outAlphas, outLastIds};
 }
 
-template <uint32_t NUM_CHANNELS, typename Camera>
+template <typename Camera>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 launchForwardPrivateUse1(const torch::Tensor &means,
                          const torch::Tensor &quats,
@@ -376,7 +381,8 @@ launchForwardPrivateUse1(const torch::Tensor &means,
                          const torch::Tensor &tileOffsets,
                          const torch::Tensor &tileGaussianIds,
                          const at::optional<torch::Tensor> &backgrounds,
-                         const at::optional<torch::Tensor> &masks) {
+                         const at::optional<torch::Tensor> &masks,
+                         RasterizeKernel<RasterizeFromWorldForwardArgs<Camera>> kernel) {
     TORCH_CHECK(tileSize > 0, "Tile size must be greater than 0");
 
     const int64_t C              = features.size(0);
@@ -389,7 +395,7 @@ launchForwardPrivateUse1(const torch::Tensor &means,
     // no intersections, so the managed outputs do not need a separate initialization kernel.
     const auto opts = features.options();
     torch::Tensor outFeatures =
-        torch::empty({C, (int64_t)imageHeight, (int64_t)imageWidth, (int64_t)NUM_CHANNELS}, opts);
+        torch::empty({C, (int64_t)imageHeight, (int64_t)imageWidth, features.size(2)}, opts);
     torch::Tensor outAlphas = torch::empty({C, (int64_t)imageHeight, (int64_t)imageWidth, 1}, opts);
     torch::Tensor outLastIds =
         torch::empty({C, (int64_t)imageHeight, (int64_t)imageWidth}, opts.dtype(torch::kInt32));
@@ -452,27 +458,28 @@ launchForwardPrivateUse1(const torch::Tensor &means,
 
         const auto [deviceTileOffset, deviceTileCount] = deviceChunk(tileCount, deviceId);
         if (deviceTileCount > 0) {
-            launchForwardKernel<NUM_CHANNELS, Camera>(means,
-                                                      quats,
-                                                      logScales,
-                                                      features,
-                                                      opacities,
-                                                      camera,
-                                                      imageWidth,
-                                                      imageHeight,
-                                                      imageOriginW,
-                                                      imageOriginH,
-                                                      tileSize,
-                                                      contiguousTileOffsets,
-                                                      contiguousTileGaussianIds,
-                                                      contiguousBackgrounds,
-                                                      contiguousMasks,
-                                                      outFeatures,
-                                                      outAlphas,
-                                                      outLastIds,
-                                                      static_cast<uint32_t>(deviceTileOffset),
-                                                      static_cast<uint32_t>(deviceTileCount),
-                                                      stream);
+            launchForwardKernel(means,
+                                quats,
+                                logScales,
+                                features,
+                                opacities,
+                                camera,
+                                imageWidth,
+                                imageHeight,
+                                imageOriginW,
+                                imageOriginH,
+                                tileSize,
+                                contiguousTileOffsets,
+                                contiguousTileGaussianIds,
+                                contiguousBackgrounds,
+                                contiguousMasks,
+                                outFeatures,
+                                outAlphas,
+                                outLastIds,
+                                static_cast<uint32_t>(deviceTileOffset),
+                                static_cast<uint32_t>(deviceTileCount),
+                                stream,
+                                kernel);
         }
     }
 
@@ -580,23 +587,24 @@ dispatchGaussianRasterizeFromWorld3DGSForward<torch::kCUDA>(
 
     const uint32_t channels = (uint32_t)features.size(2);
 
-#define CALL_FWD_WITH_OP(NCH, OP_TYPE, OP_VAL)                  \
-    case NCH:                                                   \
-        return launchForwardCUDA<NCH, OP_TYPE>(means,           \
-                                               quats,           \
-                                               logScales,       \
-                                               features,        \
-                                               opacities,       \
-                                               OP_VAL,          \
-                                               imageWidth,      \
-                                               imageHeight,     \
-                                               imageOriginW,    \
-                                               imageOriginH,    \
-                                               tileSize,        \
-                                               tileOffsets,     \
-                                               tileGaussianIds, \
-                                               backgrounds,     \
-                                               masks);
+#define CALL_FWD_WITH_OP(NCH, OP_TYPE, OP_VAL)             \
+    case NCH:                                              \
+        return launchForwardCUDA<OP_TYPE>(means,           \
+                                          quats,           \
+                                          logScales,       \
+                                          features,        \
+                                          opacities,       \
+                                          OP_VAL,          \
+                                          imageWidth,      \
+                                          imageHeight,     \
+                                          imageOriginW,    \
+                                          imageOriginH,    \
+                                          tileSize,        \
+                                          tileOffsets,     \
+                                          tileGaussianIds, \
+                                          backgrounds,     \
+                                          masks,           \
+                                          rasterizeGaussiansFromWorld<NCH, OP_TYPE>);
 
     if (cameraModel == DistortionModel::ORTHOGRAPHIC) {
         const OrthographicWithDistortionCamera<float> camera{worldToCamMatricesStart,
@@ -754,23 +762,24 @@ dispatchGaussianRasterizeFromWorld3DGSForward<torch::kPrivateUse1>(
 
     const uint32_t channels = (uint32_t)features.size(2);
 
-#define CALL_FWD_PRIVATEUSE1_WITH_OP(NCH, OP_TYPE, OP_VAL)             \
-    case NCH:                                                          \
-        return launchForwardPrivateUse1<NCH, OP_TYPE>(means,           \
-                                                      quats,           \
-                                                      logScales,       \
-                                                      features,        \
-                                                      opacities,       \
-                                                      OP_VAL,          \
-                                                      imageWidth,      \
-                                                      imageHeight,     \
-                                                      imageOriginW,    \
-                                                      imageOriginH,    \
-                                                      tileSize,        \
-                                                      tileOffsets,     \
-                                                      tileGaussianIds, \
-                                                      backgrounds,     \
-                                                      masks);
+#define CALL_FWD_PRIVATEUSE1_WITH_OP(NCH, OP_TYPE, OP_VAL)        \
+    case NCH:                                                     \
+        return launchForwardPrivateUse1<OP_TYPE>(means,           \
+                                                 quats,           \
+                                                 logScales,       \
+                                                 features,        \
+                                                 opacities,       \
+                                                 OP_VAL,          \
+                                                 imageWidth,      \
+                                                 imageHeight,     \
+                                                 imageOriginW,    \
+                                                 imageOriginH,    \
+                                                 tileSize,        \
+                                                 tileOffsets,     \
+                                                 tileGaussianIds, \
+                                                 backgrounds,     \
+                                                 masks,           \
+                                                 rasterizeGaussiansFromWorld<NCH, OP_TYPE>);
 
     if (cameraModel == DistortionModel::ORTHOGRAPHIC) {
         const OrthographicWithDistortionCamera<float> camera{worldToCamMatricesStart,
