@@ -666,8 +666,8 @@ launchRasterizeForwardKernels(
     auto reshapedFeatures =
         outFeatures.jdata().view({C, renderWindow.height, renderWindow.width, channels});
 
-    std::vector<torch::Tensor> tileTensors = {
-        tileOffsets, reshapedAlphas, reshapedLastIds, reshapedFeatures};
+    std::vector<torch::Tensor> outputTensors = {
+        reshapedAlphas, reshapedLastIds, reshapedFeatures};
     std::vector<torch::Tensor> gaussianTensors = {means2d, conics, features, opacities};
 
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
@@ -687,7 +687,20 @@ launchRasterizeForwardKernels(
                                               renderWindow.height,
                                               renderWindow.width,
                                               tileSize};
-            appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, tileTensors, tileRange);
+            appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, outputTensors, tileRange);
+            // These outputs are overwritten. Keep discard restricted to complete tile rows,
+            // whose image ranges are contiguous.
+            if (!isSparse && deviceTileOffset % tileExtentW == 0 &&
+                deviceTileCount % tileExtentW == 0) {
+                memDiscardAndPrefetchBatchAsync(
+                    prefetchPointers, prefetchSizes, deviceId, prefetchStream);
+            } else {
+                memPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
+            }
+
+            prefetchPointers.clear();
+            prefetchSizes.clear();
+            appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, {tileOffsets}, tileRange);
             if constexpr (!IS_PACKED) {
                 if (!isSparse) {
                     // Prefetch Gaussian inputs only for cameras fully owned by this device.
