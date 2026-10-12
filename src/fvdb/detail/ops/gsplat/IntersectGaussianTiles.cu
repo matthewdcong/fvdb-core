@@ -726,9 +726,19 @@ computeGaussianTileIntersections(
         const int32_t cidx =
             cameraJIdx == nullptr ? gidx / numGaussiansPerCamera : cameraJIdx[gidx];
 
-        const int32_t radiusU = radii[gidx * 2 + 0];
-        const int32_t radiusV = radii[gidx * 2 + 1];
-        if (radiusU > 0 && radiusV > 0) {
+        int32_t radiusU = 0;
+        int32_t radiusV = 0;
+        bool hasIntersections;
+        if constexpr (std::is_same_v<TileIteratorT, EllipseTileIterator>) {
+            // Counting already checked radii; ellipse emission only needs nonzero counts.
+            const int64_t isectStart = (idx == 0) ? 0 : cumTilesPerGaussian[idx - 1];
+            hasIntersections = cumTilesPerGaussian[idx] != isectStart;
+        } else {
+            radiusU = radii[gidx * 2 + 0];
+            radiusV = radii[gidx * 2 + 1];
+            hasIntersections = radiusU > 0 && radiusV > 0;
+        }
+        if (hasIntersections) {
             const float2 mean2d = *reinterpret_cast<const float2 *>(means2d + 2 * gidx);
 
             // If you use float64, we're casting you to float32 so we can
@@ -1352,7 +1362,11 @@ intersectGaussianTilesPrivateUse1Impl(
     std::vector<int64_t *> deviceTilesPerGaussianCumsum(c10::cuda::device_count(), nullptr);
     std::vector<cudaEvent_t> inputPrefetchEvents(c10::cuda::device_count(), nullptr);
 
-    std::vector<torch::Tensor> inputTensors = {means2d, radii, depths};
+    std::vector<torch::Tensor> inputTensors = {means2d};
+    if (!conics.has_value()) {
+        inputTensors.push_back(radii);
+    }
+    inputTensors.push_back(depths);
     if (conics.has_value()) {
         inputTensors.push_back(conics.value());
         inputTensors.push_back(opacities.value());
