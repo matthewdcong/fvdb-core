@@ -633,7 +633,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         tileTensors.emplace_back(contiguousMasks.value());
     }
 
-    // Overlap input prefetching with local-gradient initialization on the compute streams.
+    // Overlap input prefetching with local-gradient initialization and rasterization.
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -643,6 +643,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
+        C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
 
         dMeansLocals[deviceId]     = makeLocalGradient(means, deviceId, stream);
         dQuatsLocals[deviceId]     = makeLocalGradient(quats, deviceId, stream);
@@ -665,11 +666,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
             memPrefetchBatchAsync(
                 prefetchPointers, prefetchSizes, deviceId, prefetchStreams[deviceId]);
         }
-        C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStreams[deviceId]));
-        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
-        C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
-
-        // Prefetch outputs after input readiness so shared-camera rasterization can overlap it.
+        // Later output-prefetch waits also complete input prefetching on this stream.
         cameraGradients.prefetchOutputs(deviceId, prefetchStreams[deviceId]);
     }
 

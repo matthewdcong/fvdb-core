@@ -1312,7 +1312,7 @@ callRasterizeBackwardPrivateUse1(
     std::vector<torch::Tensor> outDLossDOpacitiesLocals(c10::cuda::device_count());
     std::vector<torch::Tensor> outDLossDMeans2dAbsLocals(c10::cuda::device_count());
 
-    // Overlap input prefetching with local-gradient initialization on the compute streams.
+    // Overlap input prefetching with local-gradient initialization and rasterization.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -1322,6 +1322,7 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
+        C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
 
         if (cameraGradients.has_value()) {
             cameraGradients->prepare(deviceId);
@@ -1364,11 +1365,7 @@ callRasterizeBackwardPrivateUse1(
             memPrefetchBatchAsync(
                 prefetchPointers, prefetchSizes, deviceId, prefetchStreams[deviceId]);
         }
-        C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStreams[deviceId]));
-        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
-        C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
-
-        // Prefetch outputs after input readiness so shared-camera rasterization can overlap it.
+        // Later output-prefetch waits also complete input prefetching on this stream.
         if (cameraGradients.has_value()) {
             cameraGradients->prefetchOutputs(deviceId, prefetchStreams[deviceId]);
         }

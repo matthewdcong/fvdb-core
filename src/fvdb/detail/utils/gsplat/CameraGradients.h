@@ -71,7 +71,7 @@ class CameraGradients {
         }
     }
 
-    // Initialize local gradients before the compute stream waits for input prefetching.
+    // Initialize local gradients on the compute stream while inputs are prefetched.
     void
     prepare(c10::DeviceIndex deviceId) {
         const auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -88,8 +88,8 @@ class CameraGradients {
         }
     }
 
-    // Call after recording input readiness on the device's prefetch stream. Only that device's
-    // output writers need to wait for its output prefetches.
+    // Queue after input prefetching on the device's prefetch stream. Only that device's output
+    // writers need to wait; the output event also covers completion of its input prefetches.
     void
     prefetchOutputs(c10::DeviceIndex deviceId, cudaStream_t prefetchStream) {
         std::vector<void *> prefetchPointers;
