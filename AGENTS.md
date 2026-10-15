@@ -102,3 +102,55 @@ C++ files:
 - `.vscode/settings.json` - local IDE settings
 - `.cursor/` - local Cursor config
 - Test-specific matrices or configs with hardcoded paths
+
+## CUDA Performance Work
+
+- Prefer small, self-contained experiments within one operator. Change one
+  performance mechanism at a time so captures can attribute the result.
+- Do not build, run tests, or format unless requested. Report which validation
+  was actually performed.
+- The primary objective is multi-GPU scaling relative to single-GPU performance.
+  Distinguish absolute kernel improvements from scalability improvements.
+- Consider both one camera per GPU and multiple GPUs sharing one camera.
+
+## Profiling and Comparisons
+
+- Use the user's requested baseline. Do not silently substitute the preceding
+  capture.
+- Record the source revision, outstanding changes, checkpoint, and profiling
+  options associated with each capture. Ask when attribution is ambiguous.
+- Compare matching iterations and exclude warmup consistently. State the sample
+  count and exclusions.
+- Report per-GPU kernel durations, start skew, combined elapsed span, and
+  end-to-end iteration time separately.
+- Check GPU clocks and competing graphics/compute activity before attributing
+  timing differences to code. GPU1 graphics activity has affected prior runs.
+  Treat activity-based filtering as supporting evidence, not a controlled run.
+- Use page-fault-enabled captures primarily to locate and correlate faults;
+  tracing overhead makes them unsuitable as direct performance baselines.
+- Distinguish measured NVLink bytes from integrated utilization metrics.
+  A copy labeled Peer-to-Peer does not by itself establish NVLink traffic.
+- High LSU utilization does not imply DRAM bandwidth saturation. Use instruction,
+  dependency-stall, cache, and bandwidth measurements to identify the bottleneck.
+- Check registers, occupancy, and spills when changing reductions or unrolling.
+  Fewer instructions do not guarantee lower runtime.
+- Keep detailed capture comparisons and experimental outcomes in a profiling log,
+  rather than embedding changing benchmark numbers in AGENTS.md.
+
+## Multi-GPU Implementation Conventions
+
+- The sleepKernel is intentional; do not propose removing it as an optimization.
+- Name getCurrentCUDAStream() results `stream`, and streams obtained for
+  prefetching `prefetchStream`.
+- Prefer std::tie for assignment to existing variables and indexed loops when
+  managing per-device streams and events.
+- Set the appropriate CUDA device before destroying its events.
+- Keep stream management internal to operators.
+- Do not mix PyTorch kPrivateUse1 and kCUDA tensor backends.
+- Preserve Gaussian ownership and camera/tile ownership explicitly when reasoning
+  about placement. Prefetching an overlapping range onto multiple GPUs can cause
+  migration contention.
+- Avoid quadratic cross-device event waits. Add synchronization only for a
+  concrete dependency; do not assume page-sharing hazards are proven absent.
+- Use consistent index types and existing helpers such as ceil_div. Avoid casts
+  that are unnecessary given the operand and destination types.
