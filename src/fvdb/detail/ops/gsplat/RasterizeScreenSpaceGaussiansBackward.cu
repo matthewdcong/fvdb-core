@@ -14,8 +14,10 @@
 #include <fvdb/detail/utils/gsplat/GaussianRasterize.cuh>
 
 #include <ATen/cuda/Atomic.cuh>
+#include <ATen/ops/from_blob.h>
 #include <c10/core/DeviceType.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/csrc/cuda/nccl.h>
 
 #include <cooperative_groups.h>
 
@@ -1164,6 +1166,48 @@ callRasterizeBackwardWithCorrectSharedChannels(
     }
 }
 
+// Queue one reduction per camera and Gaussian owner. The caller groups these operations after
+// output prefetching and keeps the local gradients and managed output alive through reduction.
+template <typename ScalarType>
+void
+reduceCameraGradientShards(const std::vector<torch::Tensor> &localGradients,
+                           torch::Tensor &outputGradient,
+                           const torch::cuda::nccl::comm_list &comms) {
+    std::vector<torch::Tensor> inputShards(c10::cuda::device_count());
+    for (const auto ownerId: c10::irange(c10::cuda::device_count())) {
+        int64_t gaussianOffset, gaussianCount;
+        std::tie(gaussianOffset, gaussianCount) = deviceChunk(outputGradient.size(1), ownerId);
+        if (gaussianCount == 0) {
+            continue;
+        }
+
+        const int64_t elementCount = gaussianCount * outputGradient.stride(1);
+        for (const auto cameraId: c10::irange(outputGradient.size(0))) {
+            const int64_t elementOffset =
+                cameraId * outputGradient.stride(0) + gaussianOffset * outputGradient.stride(1);
+            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+                inputShards[deviceId] = localGradients[deviceId]
+                                            .select(0, cameraId)
+                                            .narrow(0, gaussianOffset, gaussianCount);
+            }
+
+            // Give NCCL a non-owning CUDA view on the receiving device. The PrivateUse1 output
+            // retains ownership of the managed allocation; all NCCL tensor arguments are CUDA.
+            auto outputShard =
+                at::for_blob(outputGradient.data_ptr<ScalarType>() + elementOffset, {elementCount})
+                    .options(localGradients[ownerId].options())
+                    .target_device(localGradients[ownerId].device())
+                    .make_tensor();
+            torch::cuda::nccl::reduce(inputShards,
+                                      outputShard,
+                                      ownerId,
+                                      static_cast<int>(torch::cuda::nccl::ncclRedOp::Sum),
+                                      {},
+                                      comms);
+        }
+    }
+}
+
 template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 callRasterizeBackwardPrivateUse1(
@@ -1198,8 +1242,8 @@ callRasterizeBackwardPrivateUse1(
                                torch::zeros_like(opacities));
     }
 
-    // These managed outputs are populated from contiguous, device-local gradient shards after the
-    // raster kernels complete. Keep them contiguous so each device can publish one flat range.
+    // Dense gradients are reduced directly into each device's Gaussian shard in every camera.
+    // Packed gradients retain the flat reduce-scatter and copy path.
     torch::Tensor outDLossDMeans2d   = torch::empty(means2d.sizes(), means2d.options());
     torch::Tensor outDLossDConics    = torch::empty(conics.sizes(), conics.options());
     torch::Tensor outDLossDFeatures  = torch::empty(features.sizes(), features.options());
@@ -1372,28 +1416,46 @@ callRasterizeBackwardPrivateUse1(
         std::vector<void *> prefetchPointers;
         std::vector<size_t> prefetchSizes;
         for (const torch::Tensor &outTensor: outTensors) {
-            int64_t elementOffset, elementCount;
-            std::tie(elementOffset, elementCount) = deviceChunk(outTensor.numel(), deviceId);
-            if (elementCount > 0) {
-                prefetchPointers.emplace_back(outTensor.data_ptr<ScalarType>() + elementOffset);
-                prefetchSizes.emplace_back(elementCount * sizeof(ScalarType));
+            if constexpr (IS_PACKED) {
+                int64_t elementOffset, elementCount;
+                std::tie(elementOffset, elementCount) = deviceChunk(outTensor.numel(), deviceId);
+                if (elementCount > 0) {
+                    prefetchPointers.emplace_back(outTensor.data_ptr<ScalarType>() + elementOffset);
+                    prefetchSizes.emplace_back(elementCount * sizeof(ScalarType));
+                }
+            } else {
+                // Match the Gaussian shard written by dense reductions and consumed by SH and
+                // projection backward in every camera.
+                int64_t gaussianOffset, gaussianCount;
+                std::tie(gaussianOffset, gaussianCount) = deviceChunk(means2d.size(1), deviceId);
+                if (gaussianCount > 0) {
+                    for (const auto cameraId: c10::irange(outTensor.size(0))) {
+                        prefetchPointers.emplace_back(outTensor.data_ptr<ScalarType>() +
+                                                      cameraId * outTensor.stride(0) +
+                                                      gaussianOffset * outTensor.stride(1));
+                        prefetchSizes.emplace_back(gaussianCount * outTensor.stride(1) *
+                                                   sizeof(ScalarType));
+                    }
+                }
             }
         }
         memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
 
-        // Output copies wait on these events after all reductions have been queued.
+        // Dense reductions and packed output copies wait for output prefetching.
         C10_CUDA_CHECK(
             cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId], cudaEventDisableTiming));
         C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
     }
 
-    // Queue every reduction before waiting so they can all overlap with output prefetching.
-    reduceGradientShards(outDLossDMeans2dLocals);
-    reduceGradientShards(outDLossDConicsLocals);
-    reduceGradientShards(outDLossDFeaturesLocals);
-    reduceGradientShards(outDLossDOpacitiesLocals);
-    if (absGrad) {
-        reduceGradientShards(outDLossDMeans2dAbsLocals);
+    if constexpr (IS_PACKED) {
+        // Packed reductions write only local buffers and can overlap output prefetching.
+        reduceGradientShards(outDLossDMeans2dLocals);
+        reduceGradientShards(outDLossDConicsLocals);
+        reduceGradientShards(outDLossDFeaturesLocals);
+        reduceGradientShards(outDLossDOpacitiesLocals);
+        if (absGrad) {
+            reduceGradientShards(outDLossDMeans2dAbsLocals);
+        }
     }
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -1402,15 +1464,36 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    copyGradientShards<ScalarType>(outDLossDMeans2dLocals, outDLossDMeans2d);
-    copyGradientShards<ScalarType>(outDLossDConicsLocals, outDLossDConics);
-    copyGradientShards<ScalarType>(outDLossDFeaturesLocals, outDLossDFeatures);
-    copyGradientShards<ScalarType>(outDLossDOpacitiesLocals, outDLossDOpacities);
-    if (absGrad) {
-        copyGradientShards<ScalarType>(outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs);
+    // Finish every discard-prefetch before writing managed outputs, including boundary pages
+    // shared by neighboring Gaussian shards.
+    mergeStreams();
+
+    if constexpr (IS_PACKED) {
+        copyGradientShards<ScalarType>(outDLossDMeans2dLocals, outDLossDMeans2d);
+        copyGradientShards<ScalarType>(outDLossDConicsLocals, outDLossDConics);
+        copyGradientShards<ScalarType>(outDLossDFeaturesLocals, outDLossDFeatures);
+        copyGradientShards<ScalarType>(outDLossDOpacitiesLocals, outDLossDOpacities);
+        if (absGrad) {
+            copyGradientShards<ScalarType>(outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs);
+        }
+    } else {
+        // Initialize PyTorch's cached communicators before opening the collective group: NCCL
+        // communicator initialization cannot be grouped with reductions.
+        const auto commsRef = torch::cuda::nccl::detail::get_communicators(outDLossDMeans2dLocals);
+        const torch::cuda::nccl::comm_list comms(commsRef.begin(), commsRef.end());
+        torch::cuda::nccl::AutoNcclGroup ncclGroup;
+        reduceCameraGradientShards<ScalarType>(outDLossDMeans2dLocals, outDLossDMeans2d, comms);
+        reduceCameraGradientShards<ScalarType>(outDLossDConicsLocals, outDLossDConics, comms);
+        reduceCameraGradientShards<ScalarType>(outDLossDFeaturesLocals, outDLossDFeatures, comms);
+        reduceCameraGradientShards<ScalarType>(outDLossDOpacitiesLocals, outDLossDOpacities, comms);
+        if (absGrad) {
+            reduceCameraGradientShards<ScalarType>(
+                outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs, comms);
+        }
     }
 
-    // Enqueue frees after the reductions and output copies, before merging the compute streams.
+    // The NCCL group has submitted all reductions before frees are queued on allocation streams.
+    // Packed output copies are also ordered before these frees.
     outDLossDMeans2dLocals.clear();
     outDLossDConicsLocals.clear();
     outDLossDFeaturesLocals.clear();

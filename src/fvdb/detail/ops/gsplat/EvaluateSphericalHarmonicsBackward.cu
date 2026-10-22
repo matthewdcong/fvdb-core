@@ -914,7 +914,8 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
         std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
         std::vector<torch::Tensor> dLossDWorldToCamMatricesLocals(c10::cuda::device_count());
 
-        // Prefetch outputs first, then overlap their zeroing with incoming-gradient prefetching.
+        // Rasterization backward prefetches the incoming gradients by Gaussian shard per camera.
+        // Prefetch only the new outputs before zeroing them on the compute stream.
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -957,27 +958,13 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
                 memDiscardAndPrefetchBatchAsync(
                     prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
 
-                // Zero outputs once resident while the prefetch stream prepares the inputs.
+                // Zero outputs after their prefetch completes.
                 C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
                 C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
                 for (const auto i: c10::irange(prefetchPtrs.size())) {
                     C10_CUDA_CHECK(cudaMemsetAsync(prefetchPtrs[i], 0, prefetchSizes[i], stream));
                 }
-
-                prefetchPtrs.clear();
-                prefetchSizes.clear();
-                for (int cameraIndex = 0; cameraIndex < C; ++cameraIndex) {
-                    prefetchPtrs.emplace_back(dLossDRenderQuantities.data_ptr<scalar_t>() +
-                                              cameraIndex * dLossDRenderQuantities.stride(0) +
-                                              elementOffset * dLossDRenderQuantities.stride(1));
-                    prefetchSizes.emplace_back(elementCount * dLossDRenderQuantities.stride(1) *
-                                               sizeof(scalar_t));
-                }
-                memPrefetchBatchAsync(prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
             }
-            // Join input prefetching after output zeroing, before the SH kernel.
-            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
-            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
             C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
         }
 
@@ -1100,7 +1087,8 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
                 dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices);
         }
 
-        // Prefetch outputs first, then overlap their zeroing with incoming-gradient prefetching.
+        // Rasterization backward prefetches the incoming gradients by Gaussian shard per camera.
+        // Prefetch only the new outputs before zeroing them on the compute stream.
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream         = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -1125,27 +1113,13 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
                 memDiscardAndPrefetchBatchAsync(
                     prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
 
-                // Zero outputs once resident while the prefetch stream prepares the inputs.
+                // Zero outputs after their prefetch completes.
                 C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
                 C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
                 for (const auto i: c10::irange(prefetchPtrs.size())) {
                     C10_CUDA_CHECK(cudaMemsetAsync(prefetchPtrs[i], 0, prefetchSizes[i], stream));
                 }
-
-                prefetchPtrs.clear();
-                prefetchSizes.clear();
-                for (int cameraIndex = 0; cameraIndex < C; ++cameraIndex) {
-                    prefetchPtrs.emplace_back(dLossDRenderQuantities.data_ptr<scalar_t>() +
-                                              cameraIndex * dLossDRenderQuantities.stride(0) +
-                                              elementOffset * dLossDRenderQuantities.stride(1));
-                    prefetchSizes.emplace_back(elementCount * dLossDRenderQuantities.stride(1) *
-                                               sizeof(scalar_t));
-                }
-                memPrefetchBatchAsync(prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
             }
-            // Join input prefetching after output zeroing, before the SH kernel.
-            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
-            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
             C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
         }
 
