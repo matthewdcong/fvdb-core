@@ -1730,9 +1730,31 @@ callRasterizeBackwardPrivateUse1(
             compact, gradientShards, &requestedCountsPtr[deviceId], shardOffsets[deviceId], stream);
     }
 
+    // Submit every output prefetch before the count readback can block the host launch thread.
+    // Reuse the input prefetch streams to preserve their ordering. Rasterization writes local
+    // gradients, so only the reduction needs to wait for output placement.
+    std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto prefetchStream = prefetchStreams[deviceId];
+        std::vector<void *> prefetchPointers;
+        std::vector<size_t> prefetchSizes;
+        for (const auto &shard: gradientShards) {
+            if (shard.ownerId == deviceId) {
+                prefetchPointers.emplace_back(outTensors[shard.tensorIndex].data_ptr<ScalarType>() +
+                                              shard.firstElement);
+                prefetchSizes.emplace_back(shard.numElements * sizeof(ScalarType));
+            }
+        }
+        memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
+
+        C10_CUDA_CHECK(
+            cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId], cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
+    }
+
     // Counts must reach the host before exact-size allocation. All scans and count copies above
     // are already enqueued, so one device can gather and rasterize while another finishes its scan.
-    // Launch rasterization on every device before submitting output prefetches.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -1841,30 +1863,7 @@ callRasterizeBackwardPrivateUse1(
         compact.globalToLocal = torch::Tensor();
     }
 
-    // Rasterization writes to device-local buffers prior to the cross-device reduction so it
-    // can be overlapped with output prefetching.
-    // Reuse the input prefetch streams to preserve their waits and ordering.
-    std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
-    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto prefetchStream = prefetchStreams[deviceId];
-        std::vector<void *> prefetchPointers;
-        std::vector<size_t> prefetchSizes;
-        for (const auto &shard: gradientShards) {
-            if (shard.ownerId == deviceId) {
-                prefetchPointers.emplace_back(outTensors[shard.tensorIndex].data_ptr<ScalarType>() +
-                                              shard.firstElement);
-                prefetchSizes.emplace_back(shard.numElements * sizeof(ScalarType));
-            }
-        }
-        memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
-
-        // Scatter-add reductions wait for output prefetching.
-        C10_CUDA_CHECK(
-            cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId], cudaEventDisableTiming));
-        C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
-    }
-
+    // Scatter-add reductions wait for output prefetching after rasterization has been submitted.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
