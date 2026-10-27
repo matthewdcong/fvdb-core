@@ -6,7 +6,6 @@
 #include <fvdb/detail/utils/Utils.h>
 #include <fvdb/detail/utils/cuda/GradientReduction.h>
 #include <fvdb/detail/utils/cuda/LocalGradient.h>
-#include <fvdb/detail/utils/cuda/Prefetch.h>
 #include <fvdb/detail/utils/cuda/Utils.cuh>
 #include <fvdb/detail/utils/cuda/WarpReduce.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterizeFromWorld.cuh>
@@ -583,7 +582,7 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
                 torch::zeros_like(opacities)};
     }
 
-    // Use the forward pass's full-width tile rows for both input prefetch and rasterization.
+    // Use the forward pass's full-width tile rows for rasterization.
     const int64_t tileAlignment = tileExtentW;
 
     // Each GPU accumulates into device-local buffers. The managed outputs are populated after the
@@ -602,7 +601,6 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
 
     const auto deviceCount = c10::cuda::device_count();
     TORCH_CHECK(deviceCount > 0, "PrivateUse1 rasterization requires at least one CUDA device");
-    std::vector<cudaStream_t> prefetchStreams(deviceCount);
     // Keep each device's current compute stream unchanged through allocation, rasterization,
     // reduction, and release: the owning tensors enqueue their frees on their allocation streams.
     std::vector<torch::Tensor> dMeansLocals(deviceCount);
@@ -611,46 +609,6 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
     std::vector<torch::Tensor> dFeaturesLocals(deviceCount);
     std::vector<torch::Tensor> dOpacitiesLocals(deviceCount);
 
-    std::vector<torch::Tensor> tileTensors = {
-        renderedAlphas, lastIds, dLossDRenderedFeatures, dLossDRenderedAlphas};
-    if (contiguousMasks.has_value()) {
-        tileTensors.emplace_back(contiguousMasks.value());
-    }
-
-    // Prefetch inputs after prior work, then make the current streams wait for those inputs.
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
-        prefetchStreams[deviceId] = c10::cuda::getStreamFromPool(false, deviceId);
-
-        cudaEvent_t prefetchEvent;
-        C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
-        C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
-        C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
-
-        int64_t deviceTileOffset, deviceTileCount;
-        std::tie(deviceTileOffset, deviceTileCount) =
-            deviceAlignedChunk(tileAlignment, tileCount, deviceId);
-        if (deviceTileCount > 0) {
-            std::vector<void *> prefetchPointers;
-            std::vector<size_t> prefetchSizes;
-            const TilePrefetchRange tileRange{deviceTileOffset,
-                                              deviceTileCount,
-                                              tileExtentH,
-                                              tileExtentW,
-                                              imageHeight,
-                                              imageWidth,
-                                              tileSize};
-            appendPerTilePrefetchRanges(prefetchPointers, prefetchSizes, tileTensors, tileRange);
-            memPrefetchBatchAsync(
-                prefetchPointers, prefetchSizes, deviceId, prefetchStreams[deviceId]);
-        }
-        C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStreams[deviceId]));
-        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
-        C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
-    }
-
-    // Launch rasterization on every device before submitting output prefetches.
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -696,43 +654,11 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         }
     }
 
-    // Rasterization writes to device-local buffers, allowing output prefetching to overlap.
-    // Reuse the input prefetch streams to preserve their waits and ordering.
-    const std::vector<torch::Tensor> outTensors = {
-        dMeans, dQuats, dLogScales, dFeatures, dOpacities};
-    std::vector<cudaEvent_t> outputPrefetchEvents(deviceCount);
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto prefetchStream = prefetchStreams[deviceId];
-        std::vector<void *> prefetchPointers;
-        std::vector<size_t> prefetchSizes;
-        for (const torch::Tensor &outTensor: outTensors) {
-            const auto [elementOffset, elementCount] = deviceChunk(outTensor.numel(), deviceId);
-            if (elementCount > 0) {
-                prefetchPointers.emplace_back(outTensor.data_ptr<float>() + elementOffset);
-                prefetchSizes.emplace_back(elementCount * sizeof(float));
-            }
-        }
-        memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
-
-        // Output copies wait on these events after all reductions have been queued.
-        C10_CUDA_CHECK(
-            cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId], cudaEventDisableTiming));
-        C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
-    }
-
-    // Queue every reduction before waiting so they can all overlap with output prefetching.
     reduceGradientShards(dMeansLocals);
     reduceGradientShards(dQuatsLocals);
     reduceGradientShards(dLogScalesLocals);
     reduceGradientShards(dFeaturesLocals);
     reduceGradientShards(dOpacitiesLocals);
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[deviceId]));
-        C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
-    }
 
     copyGradientShards<float>(dMeansLocals, dMeans);
     copyGradientShards<float>(dQuatsLocals, dQuats);
