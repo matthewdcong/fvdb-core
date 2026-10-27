@@ -1221,7 +1221,8 @@ makeLocalGaussianGradients(const std::vector<torch::Tensor> &globalGradients,
 // All per-device buffers use the same local ordering. Only the global IDs and gradients
 // survive rasterization; reduction needs them to restore the global output indices.
 struct LocalGaussians {
-    enum Gradient { MEANS2D, CONICS, FEATURES, OPACITIES, MEANS2D_ABS };
+    // END counts the gradient slots; MEANS2D_ABS is filled only with absGrad.
+    enum Gradient { MEANS2D, CONICS, FEATURES, OPACITIES, MEANS2D_ABS, END };
 
     torch::Tensor requestMask;            // [G + 1], including the scan sentinel
     torch::Tensor globalToLocal;          // [G + 1], exclusive prefix counts
@@ -1229,52 +1230,66 @@ struct LocalGaussians {
     std::vector<torch::Tensor> gradients; // Indexed by Gradient, each [U] or [U, K]
 };
 
-// A contiguous part of one global gradient owned by one GPU.
+// A contiguous range of Gaussians whose global gradients are owned by one GPU. Every gradient
+// tensor shares the range; ownedElements() gives each tensor's owned elements within it.
 struct GradientShard {
-    size_t tensorIndex;
     c10::DeviceIndex ownerId;
-    int64_t firstElement;
-    int64_t numElements;
-    int64_t numComponents;
-
-    int64_t
-    firstGaussian() const {
-        return firstElement / numComponents;
-    }
-
-    int64_t
-    endGaussian() const {
-        return cuda::ceil_div(firstElement + numElements, numComponents);
-    }
+    int64_t firstGaussian;
+    int64_t endGaussian;
 };
 
-// Preserve global gradient placement: dense gradients are sharded by Gaussian per camera; packed
+// Dense gradients are sharded by Gaussian, so each tensor owns all of the shard's elements. Packed
 // gradients retain their flat element shards, which can split a Gaussian's component vector.
+template <bool IS_PACKED>
+std::tuple<int64_t, int64_t>
+ownedElements(const GradientShard &shard,
+              const torch::Tensor &globalGradient,
+              int64_t numGaussians) {
+    if constexpr (IS_PACKED) {
+        int64_t offset, count;
+        std::tie(offset, count) = deviceChunk(globalGradient.numel(), shard.ownerId);
+        return std::make_tuple(offset, offset + count);
+    } else {
+        const int64_t numComponents = globalGradient.numel() / numGaussians;
+        return std::make_tuple(shard.firstGaussian * numComponents,
+                               shard.endGaussian * numComponents);
+    }
+}
+
+// Preserve global gradient placement. Dense shards cover each owner's Gaussians within one camera,
+// interleaving owners so every owner's reduction starts early. Packed shards cover the union of
+// the Gaussians whose elements an owner holds in any tensor.
 template <bool IS_PACKED>
 std::vector<GradientShard>
 makeGradientShards(const std::vector<torch::Tensor> &globalGradients, int64_t numGaussians) {
     std::vector<GradientShard> shards;
-    for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
-        const auto &output          = globalGradients[tensorIndex];
-        const int64_t numComponents = output.numel() / numGaussians;
+    if constexpr (IS_PACKED) {
         for (const auto ownerId: c10::irange(c10::cuda::device_count())) {
-            if constexpr (IS_PACKED) {
+            GradientShard shard{ownerId, numGaussians, 0};
+            for (const auto &globalGradient: globalGradients) {
+                const int64_t numComponents = globalGradient.numel() / numGaussians;
                 int64_t offset, count;
-                std::tie(offset, count) = deviceChunk(output.numel(), ownerId);
+                std::tie(offset, count) = deviceChunk(globalGradient.numel(), ownerId);
                 if (count > 0) {
-                    shards.push_back({tensorIndex, ownerId, offset, count, numComponents});
+                    shard.firstGaussian = std::min(shard.firstGaussian, offset / numComponents);
+                    shard.endGaussian   = std::max(shard.endGaussian,
+                                                 cuda::ceil_div(offset + count, numComponents));
                 }
-            } else {
+            }
+            if (shard.firstGaussian < shard.endGaussian) {
+                shards.push_back(shard);
+            }
+        }
+    } else {
+        const int64_t numCameras         = globalGradients.front().size(0);
+        const int64_t gaussiansPerCamera = globalGradients.front().size(1);
+        for (int64_t cameraId = 0; cameraId < numCameras; ++cameraId) {
+            for (const auto ownerId: c10::irange(c10::cuda::device_count())) {
                 int64_t offset, count;
-                std::tie(offset, count) = deviceChunk(output.size(1), ownerId);
+                std::tie(offset, count) = deviceChunk(gaussiansPerCamera, ownerId);
                 if (count > 0) {
-                    for (int64_t cameraId = 0; cameraId < output.size(0); ++cameraId) {
-                        shards.push_back({tensorIndex,
-                                          ownerId,
-                                          (cameraId * output.size(1) + offset) * numComponents,
-                                          count * numComponents,
-                                          numComponents});
-                    }
+                    const int64_t firstGaussian = cameraId * gaussiansPerCamera + offset;
+                    shards.push_back({ownerId, firstGaussian, firstGaussian + count});
                 }
             }
         }
@@ -1282,60 +1297,121 @@ makeGradientShards(const std::vector<torch::Tensor> &globalGradients, int64_t nu
     return shards;
 }
 
+// One source's local rows for one shard, across every gradient tensor. Values are flattened in
+// tensor order: valuesEnd holds each tensor's exclusive end, and unused slots repeat the total.
+template <typename ScalarType>
+struct ShardGradients {
+    const ScalarType *localGradients[LocalGaussians::END];
+    ScalarType *globalGradients[LocalGaussians::END];
+    int64_t numComponents[LocalGaussians::END];
+    int64_t firstElement[LocalGaussians::END];
+    int64_t endElement[LocalGaussians::END];
+    int64_t valuesEnd[LocalGaussians::END];
+};
+
 template <typename ScalarType>
 __global__ void
 scatterAddLocalGradients(const int32_t *__restrict__ localToGlobal,
-                         const ScalarType *__restrict__ localGradients,
-                         ScalarType *__restrict__ globalGradient,
-                         const int64_t numValues,
-                         const int64_t numComponents,
-                         const int64_t firstElement,
-                         const int64_t endElement) {
+                         const ShardGradients<ScalarType> gradients) {
     const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    if (index >= numValues) {
-        return;
-    }
-    const int64_t outputIndex =
-        int64_t{localToGlobal[index / numComponents]} * numComponents + index % numComponents;
-    // Packed output ownership can split a Gaussian across devices. Each owner writes only its
-    // own components, even though the transferred local rows contain complete Gaussians.
-    if (outputIndex >= firstElement && outputIndex < endElement) {
-        globalGradient[outputIndex] += localGradients[index];
+    int64_t valuesBegin = 0;
+    // Unroll so each tensor slot is read at a constant parameter offset.
+#pragma unroll
+    for (size_t tensorIndex = 0; tensorIndex < LocalGaussians::END; ++tensorIndex) {
+        const int64_t valuesEnd = gradients.valuesEnd[tensorIndex];
+        if (index >= valuesBegin && index < valuesEnd) {
+            const int64_t localIndex    = index - valuesBegin;
+            const int64_t numComponents = gradients.numComponents[tensorIndex];
+            const int64_t globalIndex =
+                int64_t{localToGlobal[localIndex / numComponents]} * numComponents +
+                localIndex % numComponents;
+            // Packed global gradient ownership can split a Gaussian across devices. Each owner
+            // writes only its own components, even though the local rows contain whole Gaussians.
+            if (globalIndex >= gradients.firstElement[tensorIndex] &&
+                globalIndex < gradients.endElement[tensorIndex]) {
+                gradients.globalGradients[tensorIndex][globalIndex] +=
+                    gradients.localGradients[tensorIndex][localIndex];
+            }
+        }
+        valuesBegin = valuesEnd;
     }
 }
+
+// Owner-side staging for remote rows, sized for the owner's largest transfer.
+struct ReceiveBuffers {
+    torch::Tensor ids;
+    std::vector<torch::Tensor> gradients;
+};
 
 // Every source list contains unique sorted IDs. Sources are accumulated sequentially on the
 // owner's stream, so scatter-add needs no atomics. The caller orders all source producers and
 // each owner's output discard-prefetch before this function, and remote reads before source frees.
-template <typename ScalarType>
+template <typename ScalarType, bool IS_PACKED>
 void
 reduceScatterGradients(const std::vector<GradientShard> &shards,
                        const torch::TensorAccessor<int32_t, 3> shardOffsets,
                        const std::vector<LocalGaussians> &localGaussians,
-                       const std::vector<torch::Tensor> &globalGradients) {
-    for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
-        const auto &shard  = shards[shardIndex];
-        const auto &output = globalGradients[shard.tensorIndex];
-        C10_CUDA_CHECK(cudaSetDevice(shard.ownerId));
-        auto stream     = c10::cuda::getCurrentCUDAStream(shard.ownerId);
-        auto *outputPtr = output.data_ptr<ScalarType>();
-        C10_CUDA_CHECK(cudaMemsetAsync(
-            outputPtr + shard.firstElement, 0, shard.numElements * sizeof(ScalarType), stream));
+                       const std::vector<torch::Tensor> &globalGradients,
+                       int64_t numGaussians) {
+    TORCH_INTERNAL_ASSERT(globalGradients.size() <= LocalGaussians::END);
+    std::vector<int64_t> numComponents;
+    for (const auto &globalGradient: globalGradients) {
+        numComponents.push_back(globalGradient.numel() / numGaussians);
+    }
 
-        int64_t maxRemoteCount = 0;
+    // Shards and sources reuse each owner's receive buffers in its stream order, and the buffers
+    // are freed on that stream after the last scatter-add.
+    std::vector<int64_t> maxRemoteCount(c10::cuda::device_count(), 0);
+    for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
+        const auto ownerId = shards[shardIndex].ownerId;
         for (const auto sourceId: c10::irange(c10::cuda::device_count())) {
-            if (sourceId != shard.ownerId) {
-                const auto offsets = shardOffsets[sourceId][shardIndex];
-                maxRemoteCount     = std::max(maxRemoteCount, int64_t{offsets[1]} - offsets[0]);
+            if (sourceId != ownerId) {
+                const auto offsets      = shardOffsets[sourceId][shardIndex];
+                maxRemoteCount[ownerId] =
+                    std::max(maxRemoteCount[ownerId], int64_t{offsets[1]} - offsets[0]);
             }
         }
-        torch::Tensor receivedIds;
-        torch::Tensor receivedGradients;
-        if (maxRemoteCount > 0) {
-            receivedIds = makeDeviceBuffer(
-                {maxRemoteCount}, output.options().dtype(torch::kInt32), shard.ownerId, stream);
-            receivedGradients = makeDeviceBuffer(
-                {maxRemoteCount, shard.numComponents}, output.options(), shard.ownerId, stream);
+    }
+    const auto idOptions = globalGradients.front().options().dtype(torch::kInt32);
+    std::vector<ReceiveBuffers> receiveBuffers(c10::cuda::device_count());
+    for (const auto ownerId: c10::irange(c10::cuda::device_count())) {
+        const int64_t maxCount = maxRemoteCount[ownerId];
+        if (maxCount) {
+            C10_CUDA_CHECK(cudaSetDevice(ownerId));
+            auto stream    = c10::cuda::getCurrentCUDAStream(ownerId);
+            auto &received = receiveBuffers[ownerId];
+            received.ids   = makeDeviceBuffer({maxCount}, idOptions, ownerId, stream);
+            for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
+                received.gradients.push_back(
+                    makeDeviceBuffer({maxCount, numComponents[tensorIndex]},
+                                     globalGradients[tensorIndex].options(),
+                                     ownerId,
+                                     stream));
+            }
+        }
+    }
+
+    for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
+        const auto &shard = shards[shardIndex];
+        C10_CUDA_CHECK(cudaSetDevice(shard.ownerId));
+        auto stream = c10::cuda::getCurrentCUDAStream(shard.ownerId);
+
+        ShardGradients<ScalarType> gradients{};
+        for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
+            auto *globalGradient = globalGradients[tensorIndex].data_ptr<ScalarType>();
+            int64_t firstElement, endElement;
+            std::tie(firstElement, endElement) =
+                ownedElements<IS_PACKED>(shard, globalGradients[tensorIndex], numGaussians);
+            if (endElement > firstElement) {
+                C10_CUDA_CHECK(cudaMemsetAsync(globalGradient + firstElement,
+                                               0,
+                                               (endElement - firstElement) * sizeof(ScalarType),
+                                               stream));
+            }
+            gradients.globalGradients[tensorIndex] = globalGradient;
+            gradients.numComponents[tensorIndex]   = numComponents[tensorIndex];
+            gradients.firstElement[tensorIndex]    = firstElement;
+            gradients.endElement[tensorIndex]      = endElement;
         }
 
         for (const auto sourceId: c10::irange(c10::cuda::device_count())) {
@@ -1343,37 +1419,46 @@ reduceScatterGradients(const std::vector<GradientShard> &shards,
             const int64_t begin = offsets[0];
             const int64_t count = offsets[1] - begin;
             if (count) {
-                const auto &source      = localGaussians[sourceId];
-                const int64_t numValues = count * shard.numComponents;
-                const auto *ids         = source.localToGlobal.const_data_ptr<int32_t>() + begin;
-                const auto *values =
-                    source.gradients[shard.tensorIndex].const_data_ptr<ScalarType>() +
-                    begin * shard.numComponents;
-                if (sourceId != shard.ownerId) {
-                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedIds.data_ptr<int32_t>(),
+                const auto &source   = localGaussians[sourceId];
+                const bool isRemote  = sourceId != shard.ownerId;
+                const auto &received = receiveBuffers[shard.ownerId];
+                // Every tensor's rows share these IDs, so a remote source sends them once.
+                const auto *ids = source.localToGlobal.const_data_ptr<int32_t>() + begin;
+                if (isRemote) {
+                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(received.ids.data_ptr<int32_t>(),
                                                        shard.ownerId,
                                                        ids,
                                                        sourceId,
                                                        count * sizeof(int32_t),
                                                        stream));
-                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedGradients.data_ptr<ScalarType>(),
-                                                       shard.ownerId,
-                                                       values,
-                                                       sourceId,
-                                                       numValues * sizeof(ScalarType),
-                                                       stream));
-                    ids    = receivedIds.const_data_ptr<int32_t>();
-                    values = receivedGradients.const_data_ptr<ScalarType>();
+                    ids = received.ids.const_data_ptr<int32_t>();
                 }
+                int64_t numValues = 0;
+                for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
+                    const int64_t tensorValues = count * numComponents[tensorIndex];
+                    const auto *values =
+                        source.gradients[tensorIndex].const_data_ptr<ScalarType>() +
+                        begin * numComponents[tensorIndex];
+                    if (isRemote) {
+                        auto *receivedValues =
+                            received.gradients[tensorIndex].data_ptr<ScalarType>();
+                        C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedValues,
+                                                           shard.ownerId,
+                                                           values,
+                                                           sourceId,
+                                                           tensorValues * sizeof(ScalarType),
+                                                           stream));
+                        values = receivedValues;
+                    }
+                    gradients.localGradients[tensorIndex] = values;
+                    numValues += tensorValues;
+                    gradients.valuesEnd[tensorIndex] = numValues;
+                }
+                std::fill(gradients.valuesEnd + globalGradients.size(),
+                          gradients.valuesEnd + LocalGaussians::END,
+                          numValues);
                 scatterAddLocalGradients<ScalarType>
-                    <<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
-                        ids,
-                        values,
-                        outputPtr,
-                        numValues,
-                        shard.numComponents,
-                        shard.firstElement,
-                        shard.firstElement + shard.numElements);
+                    <<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(ids, gradients);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
         }
@@ -1689,9 +1774,9 @@ callRasterizeBackwardPrivateUse1(
     metadataIndicesPtr[0] = static_cast<int32_t>(numGaussians);
     for (size_t shardIndex = 0; shardIndex < gradientShards.size(); ++shardIndex) {
         metadataIndicesPtr[1 + 2 * shardIndex] =
-            static_cast<int32_t>(gradientShards[shardIndex].firstGaussian());
+            static_cast<int32_t>(gradientShards[shardIndex].firstGaussian);
         metadataIndicesPtr[2 + 2 * shardIndex] =
-            static_cast<int32_t>(gradientShards[shardIndex].endGaussian());
+            static_cast<int32_t>(gradientShards[shardIndex].endGaussian);
     }
     // One contiguous pinned destination per device; devices without tiles retain zero metadata.
     auto hostMetadata =
@@ -1768,9 +1853,16 @@ callRasterizeBackwardPrivateUse1(
         std::vector<size_t> prefetchSizes;
         for (const auto &shard: gradientShards) {
             if (shard.ownerId == deviceId) {
-                prefetchPointers.emplace_back(
-                    globalGradients[shard.tensorIndex].data_ptr<ScalarType>() + shard.firstElement);
-                prefetchSizes.emplace_back(shard.numElements * sizeof(ScalarType));
+                for (const auto &globalGradient: globalGradients) {
+                    const auto [firstElement, endElement] =
+                        ownedElements<IS_PACKED>(shard, globalGradient, numGaussians);
+                    if (endElement > firstElement) {
+                        prefetchPointers.emplace_back(globalGradient.data_ptr<ScalarType>() +
+                                                      firstElement);
+                        prefetchSizes.emplace_back((endElement - firstElement) *
+                                                   sizeof(ScalarType));
+                    }
+                }
             }
         }
         memDiscardAndPrefetchBatchAsync(prefetchPointers, prefetchSizes, deviceId, prefetchStream);
@@ -1906,8 +1998,8 @@ callRasterizeBackwardPrivateUse1(
     // prefetch, which the loop above already ordered.
     mergeStreams();
 
-    reduceScatterGradients<ScalarType>(
-        gradientShards, shardOffsets, localGaussians, globalGradients);
+    reduceScatterGradients<ScalarType, IS_PACKED>(
+        gradientShards, shardOffsets, localGaussians, globalGradients, numGaussians);
 
     // Remote reads run on destination streams. Order each source stream after those reads
     // before its tensors enqueue frees, and expose completed output writes to every device.
