@@ -1432,38 +1432,49 @@ struct GaussianRequestFlag {
     }
 };
 
-// Scan bool flags as int32 counts. The sentinel makes globalToLocal[G] the request count;
-// values at shard boundaries delimit slices of the sorted compact arrays for reduction.
+// Replace each metadata index with its scan value: the request count followed by shard bounds.
+__global__ void
+gatherGaussianRequestMetadata(const int32_t *__restrict__ globalToLocal,
+                              int32_t *__restrict__ metadata,
+                              const int64_t numValues) {
+    const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (index < numValues) {
+        metadata[index] = globalToLocal[metadata[index]];
+    }
+}
+
+// Scan bool flags as int32 counts, then read the count and all shard bounds in one D2H copy.
+// metadataIndices selects globalToLocal[G] and the scan values at each shard's boundaries.
 void
 scanGaussianRequests(CompactGaussians &compact,
-                     const std::vector<GradientShard> &shards,
-                     int32_t *requestedCount,
-                     torch::TensorAccessor<int32_t, 2> shardOffsets,
+                     const torch::Tensor &metadataIndices,
+                     int32_t *hostMetadata,
                      cudaStream_t stream) {
+    const auto metadata = makeLocalBuffer(metadataIndices.sizes(),
+                                           compact.globalToLocal.options(),
+                                           compact.globalToLocal.get_device(),
+                                           stream);
+    const size_t metadataBytes = metadataIndices.numel() * sizeof(int32_t);
+    C10_CUDA_CHECK(cudaMemcpyAsync(metadata.data_ptr<int32_t>(),
+                                   metadataIndices.const_data_ptr<int32_t>(),
+                                   metadataBytes,
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+
     const int64_t numGaussians = compact.requestMask.numel() - 1;
     auto *globalToLocal        = compact.globalToLocal.data_ptr<int32_t>();
     const auto requestFlags = thrust::make_transform_iterator(compact.requestMask.data_ptr<bool>(),
                                                               GaussianRequestFlag{});
     FVDB_CUB_WRAPPER_ASYNC(
         stream, cub::DeviceScan::ExclusiveSum, requestFlags, globalToLocal, numGaussians + 1);
-    C10_CUDA_CHECK(cudaMemcpyAsync(requestedCount,
-                                   globalToLocal + numGaussians,
-                                   sizeof(int32_t),
+    gatherGaussianRequestMetadata<<<GET_BLOCKS(metadata.numel(), 256), 256, 0, stream>>>(
+        globalToLocal, metadata.data_ptr<int32_t>(), metadata.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_CUDA_CHECK(cudaMemcpyAsync(hostMetadata,
+                                   metadata.const_data_ptr<int32_t>(),
+                                   metadataBytes,
                                    cudaMemcpyDeviceToHost,
                                    stream));
-    for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
-        const auto &shard = shards[shardIndex];
-        C10_CUDA_CHECK(cudaMemcpyAsync(&shardOffsets[shardIndex][0],
-                                       globalToLocal + shard.firstGaussian(),
-                                       sizeof(int32_t),
-                                       cudaMemcpyDeviceToHost,
-                                       stream));
-        C10_CUDA_CHECK(cudaMemcpyAsync(&shardOffsets[shardIndex][1],
-                                       globalToLocal + shard.endGaussian(),
-                                       sizeof(int32_t),
-                                       cudaMemcpyDeviceToHost,
-                                       stream));
-    }
 }
 
 // The exclusive scan assigns compact IDs in ascending original-ID order. Only marked entries
@@ -1663,15 +1674,28 @@ callRasterizeBackwardPrivateUse1(
     const std::vector<GradientShard> gradientShards =
         makeGradientShards<IS_PACKED>(outTensors, numGaussians);
     const int64_t numGradientShards = gradientShards.size();
-    // Pinned metadata: request counts and [begin, end) compact indices for each output shard.
-    auto hostShardOffsets = torch::zeros(
-        {c10::cuda::device_count(), numGradientShards, 2},
-        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-    auto shardOffsets    = hostShardOffsets.accessor<int32_t, 3>();
-    auto requestedCounts = torch::empty(
-        {c10::cuda::device_count()},
-        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-    auto *requestedCountsPtr = requestedCounts.data_ptr<int32_t>();
+    const int64_t numMetadataValues = 1 + 2 * numGradientShards;
+    const auto metadataOptions =
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
+    // Every device reads the same scan positions: total count, then [begin, end) for each shard.
+    // Keep this pinned index table alive until all H2D copies have completed.
+    auto metadataIndices = torch::empty({numMetadataValues}, metadataOptions);
+    auto *metadataIndicesPtr = metadataIndices.data_ptr<int32_t>();
+    metadataIndicesPtr[0] = static_cast<int32_t>(numGaussians);
+    for (size_t shardIndex = 0; shardIndex < gradientShards.size(); ++shardIndex) {
+        metadataIndicesPtr[1 + 2 * shardIndex] =
+            static_cast<int32_t>(gradientShards[shardIndex].firstGaussian());
+        metadataIndicesPtr[2 + 2 * shardIndex] =
+            static_cast<int32_t>(gradientShards[shardIndex].endGaussian());
+    }
+    // One contiguous pinned destination per device; devices without tiles retain zero metadata.
+    auto hostMetadata =
+        torch::zeros({c10::cuda::device_count(), numMetadataValues}, metadataOptions);
+    auto requestMetadata = hostMetadata.accessor<int32_t, 2>();
+    const torch::Tensor hostShardOffsets =
+        hostMetadata.narrow(1, 1, 2 * numGradientShards)
+            .view({c10::cuda::device_count(), numGradientShards, 2});
+    auto shardOffsets = hostShardOffsets.accessor<int32_t, 3>();
     // Enqueue every device's scan and readback before waiting for any allocation counts.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -1681,7 +1705,6 @@ callRasterizeBackwardPrivateUse1(
         std::tie(deviceTileOffset, deviceTileCount) =
             deviceAlignedChunk(tileAlignment, tileCount, deviceId);
         if (deviceTileCount == 0) {
-            requestedCountsPtr[deviceId] = 0;
             continue;
         }
 
@@ -1727,7 +1750,7 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
         scanGaussianRequests(
-            compact, gradientShards, &requestedCountsPtr[deviceId], shardOffsets[deviceId], stream);
+            compact, metadataIndices, requestMetadata[deviceId].data(), stream);
     }
 
     // Submit every output prefetch before the count readback can block the host launch thread.
@@ -1768,7 +1791,7 @@ callRasterizeBackwardPrivateUse1(
         }
         auto &compact = compactGaussians[deviceId];
         C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-        const int64_t numRequested = requestedCountsPtr[deviceId];
+        const int64_t numRequested = requestMetadata[deviceId][0];
         if (numRequested == 0) {
             compact.requestMask   = torch::Tensor();
             compact.globalToLocal = torch::Tensor();
