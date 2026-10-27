@@ -12,8 +12,8 @@
 #include <fvdb/detail/utils/gsplat/Gaussian2D.cuh>
 #include <fvdb/detail/utils/gsplat/GaussianRasterize.cuh>
 
-#include <ATen/EmptyTensor.h>
 #include <ATen/cuda/Atomic.cuh>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/from_blob.h>
 #include <c10/core/DeviceType.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -1161,78 +1161,50 @@ callRasterizeBackwardWithCorrectSharedChannels(
     }
 }
 
-// Allocate device-local storage and free it on the same stream. Callers must order any remote
-// reads before destruction, as the final mergeStreams does for local gradients.
-torch::Tensor
-makeDeviceBuffer(at::IntArrayRef sizes,
-                 const torch::TensorOptions &options,
-                 c10::DeviceIndex deviceId,
-                 cudaStream_t stream) {
-    const c10::Device device(c10::kCUDA, deviceId);
-
-    const size_t numBytes = at::detail::computeStorageNbytesContiguous(
-        sizes, c10::elementSize(options.dtype().toScalarType()));
-    void *ptr = nullptr;
-    if (numBytes != 0) {
-        C10_CUDA_CHECK(cudaMallocAsync(&ptr, numBytes, stream));
-    }
-    return at::from_blob(
-        ptr,
-        sizes,
-        [deviceId, stream](void *data) noexcept {
-            if (data == nullptr) {
-                return;
-            }
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            C10_CUDA_CHECK(cudaFreeAsync(data, stream));
-        },
-        options.device(device),
-        device);
+// Components per Gaussian: 1 for [C, N] or [nnz] tensors, otherwise the trailing size.
+template <bool IS_PACKED>
+int64_t
+gaussianComponents(const torch::Tensor &tensor) {
+    return tensor.dim() == (IS_PACKED ? 1 : 2) ? 1 : tensor.size(-1);
 }
 
-// Replace the source's Gaussian dimensions with the number requested on this device.
+// Non-owning view of numRows device-local rows shaped like the source's Gaussian rows. Views only
+// build accessors; the rows are raw stream-ordered allocations that the caller frees explicitly.
 template <bool IS_PACKED>
 torch::Tensor
-makeLocalGaussianBuffer(const torch::Tensor &source,
-                        int64_t numRequested,
-                        c10::DeviceIndex deviceId,
-                        cudaStream_t stream) {
-    std::vector<int64_t> shape{numRequested};
+localGaussianView(void *rows,
+                  const torch::Tensor &source,
+                  int64_t numRows,
+                  c10::DeviceIndex deviceId) {
+    std::vector<int64_t> shape{numRows};
     if (source.dim() == (IS_PACKED ? 2 : 3)) {
         shape.push_back(source.size(-1));
     }
-    return makeDeviceBuffer(shape, source.options(), deviceId, stream);
+    return at::from_blob(rows, shape, source.options().device(c10::Device(c10::kCUDA, deviceId)));
 }
 
-template <bool IS_PACKED>
-std::vector<torch::Tensor>
-makeLocalGaussianGradients(const std::vector<torch::Tensor> &globalGradients,
-                           int64_t numRequested,
-                           c10::DeviceIndex deviceId,
-                           cudaStream_t stream) {
-    std::vector<torch::Tensor> gradients;
-    gradients.reserve(globalGradients.size());
-    for (const auto &output: globalGradients) {
-        auto gradient = makeLocalGaussianBuffer<IS_PACKED>(output, numRequested, deviceId, stream);
-        C10_CUDA_CHECK(cudaMemsetAsync(
-            gradient.data_ptr(), 0, gradient.numel() * gradient.element_size(), stream));
-        gradients.push_back(std::move(gradient));
-    }
-    return gradients;
-}
+constexpr size_t NUM_LOCAL_INPUTS = 4;
 
-// All per-device buffers use the same local ordering. Only the global IDs and gradients
-// survive rasterization; reduction needs them to restore the global output indices. The request
-// maps cover the W global IDs starting at windowBegin that the device's tiles can reference.
+// Each device's buffers use the same local ordering. The request maps cover the W global IDs
+// starting at windowBegin that the device's tiles can reference. Local rows are allocated for the
+// whole window, so filling them needs no host-side request count; only the first U rows are
+// written. Every buffer is a raw cudaMallocAsync allocation on the device's current stream, freed
+// with cudaFreeAsync on that stream once its last use is queued.
+template <typename ScalarType>
 struct LocalGaussians {
     // END counts the gradient slots; MEANS2D_ABS is filled only with absGrad.
     enum Gradient { MEANS2D, CONICS, FEATURES, OPACITIES, MEANS2D_ABS, END };
 
-    int64_t windowBegin = 0;
-    torch::Tensor requestMask;            // [W + 1], including the scan sentinel
-    torch::Tensor globalToLocal;          // [W + 1], exclusive prefix counts
-    torch::Tensor localToGlobal;          // [U], sorted global IDs
-    std::vector<torch::Tensor> gradients; // Indexed by Gradient, each [U] or [U, K]
+    int64_t windowBegin    = 0;
+    int64_t windowSize     = 0;
+    bool *requestMask      = nullptr; // [W + 1], including the scan sentinel
+    int32_t *globalToLocal = nullptr; // [W + 1], exclusive prefix counts
+    int32_t *shardRanges   = nullptr; // [S, 2], local [begin, end) for each gradient shard
+    int32_t *localToGlobal = nullptr; // [W], sorted global IDs in the first U rows
+    // Means2d, conics, opacities, and features, each [W] or [W, K]
+    ScalarType *inputs[NUM_LOCAL_INPUTS] = {};
+    // Indexed by Gradient, each [W] or [W, K]
+    ScalarType *gradients[END] = {};
 };
 
 // A contiguous range of Gaussians whose global gradients are owned by one GPU. Every gradient
@@ -1302,70 +1274,85 @@ makeGradientShards(const std::vector<torch::Tensor> &globalGradients, int64_t nu
     return shards;
 }
 
-// One source's local rows for one shard, across every gradient tensor. Values are flattened in
-// tensor order: valuesEnd holds each tensor's exclusive end, and unused slots repeat the total.
+// One source's local rows for one shard, across every gradient tensor. The source's local
+// [begin, end) range for the shard is read on the device, so the host never needs the request
+// count. Values are flattened in tensor order: each row contributes numComponents[t] values to
+// tensor t, and componentsEnd holds the running sums, repeating the total in unused slots.
 template <typename ScalarType>
 struct ShardGradients {
-    const ScalarType *localGradients[LocalGaussians::END];
-    ScalarType *globalGradients[LocalGaussians::END];
-    int64_t numComponents[LocalGaussians::END];
-    int64_t firstElement[LocalGaussians::END];
-    int64_t endElement[LocalGaussians::END];
-    int64_t valuesEnd[LocalGaussians::END];
+    using Local = LocalGaussians<ScalarType>;
+
+    const int32_t *localRange;
+    const int32_t *localToGlobal;
+    const ScalarType *localGradients[Local::END];
+    ScalarType *globalGradients[Local::END];
+    int64_t numComponents[Local::END];
+    int64_t componentsEnd[Local::END];
+    int64_t firstElement[Local::END];
+    int64_t endElement[Local::END];
 };
 
+// The grid loops over the source's range, whose size is known only on the device.
 template <typename ScalarType>
 __global__ void
-scatterAddLocalGradients(const int32_t *__restrict__ localToGlobal,
-                         const ShardGradients<ScalarType> gradients) {
-    const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    int64_t valuesBegin = 0;
-    // Unroll so each tensor slot is read at a constant parameter offset.
+scatterAddLocalGradients(const ShardGradients<ScalarType> gradients) {
+    using Local = LocalGaussians<ScalarType>;
+
+    const int64_t begin     = gradients.localRange[0];
+    const int64_t count     = gradients.localRange[1] - begin;
+    const int64_t numValues = count * gradients.componentsEnd[Local::END - 1];
+    for (int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x; index < numValues;
+         index += int64_t{gridDim.x} * blockDim.x) {
+        int64_t valuesBegin = 0;
+        // Unroll so each tensor slot is read at a constant parameter offset.
 #pragma unroll
-    for (size_t tensorIndex = 0; tensorIndex < LocalGaussians::END; ++tensorIndex) {
-        const int64_t valuesEnd = gradients.valuesEnd[tensorIndex];
-        if (index >= valuesBegin && index < valuesEnd) {
-            const int64_t localIndex    = index - valuesBegin;
-            const int64_t numComponents = gradients.numComponents[tensorIndex];
-            const int64_t globalIndex =
-                int64_t{localToGlobal[localIndex / numComponents]} * numComponents +
-                localIndex % numComponents;
-            // Packed global gradient ownership can split a Gaussian across devices. Each owner
-            // writes only its own components, even though the local rows contain whole Gaussians.
-            if (globalIndex >= gradients.firstElement[tensorIndex] &&
-                globalIndex < gradients.endElement[tensorIndex]) {
-                gradients.globalGradients[tensorIndex][globalIndex] +=
-                    gradients.localGradients[tensorIndex][localIndex];
+        for (size_t tensorIndex = 0; tensorIndex < Local::END; ++tensorIndex) {
+            const int64_t valuesEnd = count * gradients.componentsEnd[tensorIndex];
+            if (index >= valuesBegin && index < valuesEnd) {
+                const int64_t numComponents = gradients.numComponents[tensorIndex];
+                const int64_t localIndex    = begin * numComponents + index - valuesBegin;
+                const int64_t globalIndex =
+                    int64_t{gradients.localToGlobal[localIndex / numComponents]} * numComponents +
+                    localIndex % numComponents;
+                // Packed global gradient ownership can split a Gaussian across devices. Each owner
+                // writes only its own components, even though the local rows contain whole
+                // Gaussians.
+                if (globalIndex >= gradients.firstElement[tensorIndex] &&
+                    globalIndex < gradients.endElement[tensorIndex]) {
+                    gradients.globalGradients[tensorIndex][globalIndex] +=
+                        gradients.localGradients[tensorIndex][localIndex];
+                }
             }
+            valuesBegin = valuesEnd;
         }
-        valuesBegin = valuesEnd;
     }
 }
 
-// Every source list contains unique sorted IDs. Owners read each source's local rows in place
-// through peer access, so remote rows need no staging copies. Sources are accumulated
-// sequentially on the owner's stream, so scatter-add needs no atomics. The caller orders all
-// source producers and each owner's output discard-prefetch before this function, and remote
-// reads before source frees.
+// Every source list contains unique sorted IDs. Owners read each source's shard range and local
+// rows in place through peer access, so neither the host nor a staging copy needs them. Sources
+// are accumulated sequentially on the owner's stream, so scatter-add needs no atomics. The caller
+// orders all source producers and each owner's output discard-prefetch before this function, and
+// remote reads before source frees.
 template <typename ScalarType, bool IS_PACKED>
 void
 reduceScatterGradients(const std::vector<GradientShard> &shards,
-                       const torch::TensorAccessor<int32_t, 3> shardOffsets,
-                       const std::vector<LocalGaussians> &localGaussians,
+                       const std::vector<LocalGaussians<ScalarType>> &localGaussians,
                        const std::vector<torch::Tensor> &globalGradients,
                        int64_t numGaussians) {
-    TORCH_INTERNAL_ASSERT(globalGradients.size() <= LocalGaussians::END);
-    std::vector<int64_t> numComponents;
-    for (const auto &globalGradient: globalGradients) {
-        numComponents.push_back(globalGradient.numel() / numGaussians);
-    }
+    using Local = LocalGaussians<ScalarType>;
 
+    TORCH_INTERNAL_ASSERT(globalGradients.size() <= Local::END);
     for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
         const auto &shard = shards[shardIndex];
         C10_CUDA_CHECK(cudaSetDevice(shard.ownerId));
         auto stream = c10::cuda::getCurrentCUDAStream(shard.ownerId);
+        // Ranges are sized on the device, so a grid that fills the owner bounds every launch.
+        const auto *properties = at::cuda::getDeviceProperties(shard.ownerId);
+        const int maxBlocks =
+            properties->multiProcessorCount * (properties->maxThreadsPerMultiProcessor / 256);
 
         ShardGradients<ScalarType> gradients{};
+        int64_t rowComponents = 0;
         for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
             auto *globalGradient = globalGradients[tensorIndex].data_ptr<ScalarType>();
             int64_t firstElement, endElement;
@@ -1378,31 +1365,32 @@ reduceScatterGradients(const std::vector<GradientShard> &shards,
                                                stream));
             }
             gradients.globalGradients[tensorIndex] = globalGradient;
-            gradients.numComponents[tensorIndex]   = numComponents[tensorIndex];
-            gradients.firstElement[tensorIndex]    = firstElement;
-            gradients.endElement[tensorIndex]      = endElement;
+            gradients.numComponents[tensorIndex] =
+                globalGradients[tensorIndex].numel() / numGaussians;
+            gradients.firstElement[tensorIndex] = firstElement;
+            gradients.endElement[tensorIndex]   = endElement;
+            rowComponents += gradients.numComponents[tensorIndex];
+            gradients.componentsEnd[tensorIndex] = rowComponents;
         }
+        std::fill(gradients.componentsEnd + globalGradients.size(),
+                  gradients.componentsEnd + Local::END,
+                  rowComponents);
 
         for (const auto sourceId: c10::irange(c10::cuda::device_count())) {
-            const auto offsets  = shardOffsets[sourceId][shardIndex];
-            const int64_t begin = offsets[0];
-            const int64_t count = offsets[1] - begin;
-            if (count) {
-                const auto &source = localGaussians[sourceId];
-                int64_t numValues  = 0;
+            const auto &source = localGaussians[sourceId];
+            // A source has rows only within its window; devices without tiles have none.
+            const int64_t firstGaussian = std::max(shard.firstGaussian, source.windowBegin);
+            const int64_t endGaussian =
+                std::min(shard.endGaussian, source.windowBegin + source.windowSize);
+            if (source.localToGlobal && endGaussian > firstGaussian) {
+                gradients.localRange    = source.shardRanges + 2 * shardIndex;
+                gradients.localToGlobal = source.localToGlobal;
                 for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
-                    gradients.localGradients[tensorIndex] =
-                        source.gradients[tensorIndex].const_data_ptr<ScalarType>() +
-                        begin * numComponents[tensorIndex];
-                    numValues += count * numComponents[tensorIndex];
-                    gradients.valuesEnd[tensorIndex] = numValues;
+                    gradients.localGradients[tensorIndex] = source.gradients[tensorIndex];
                 }
-                std::fill(gradients.valuesEnd + globalGradients.size(),
-                          gradients.valuesEnd + LocalGaussians::END,
-                          numValues);
-                scatterAddLocalGradients<ScalarType>
-                    <<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
-                        source.localToGlobal.const_data_ptr<int32_t>() + begin, gradients);
+                const int numBlocks = std::min(
+                    GET_BLOCKS((endGaussian - firstGaussian) * rowComponents, 256), maxBlocks);
+                scatterAddLocalGradients<ScalarType><<<numBlocks, 256, 0, stream>>>(gradients);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
         }
@@ -1464,72 +1452,49 @@ struct GaussianRequestFlag {
     }
 };
 
-// Replace each global metadata index with its scan value: the request count followed by shard
-// bounds. Indices before the window read 0, and indices after it read the request count.
+// Replace each global shard bound with its local ID. Bounds before the window read 0, and bounds
+// after it read the request count.
 __global__ void
-gatherGaussianRequestMetadata(const int32_t *__restrict__ globalToLocal,
-                              int32_t *__restrict__ metadata,
-                              const int64_t numValues,
-                              const int64_t windowBegin,
-                              const int64_t windowSize) {
+gatherShardRanges(const int32_t *__restrict__ globalToLocal,
+                  int32_t *__restrict__ shardRanges,
+                  const int64_t numBounds,
+                  const int64_t windowBegin,
+                  const int64_t windowSize) {
     const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    if (index < numValues) {
+    if (index < numBounds) {
         const int64_t windowIndex =
-            min(max(int64_t{metadata[index]} - windowBegin, int64_t{0}), windowSize);
-        metadata[index] = globalToLocal[windowIndex];
+            min(max(int64_t{shardRanges[index]} - windowBegin, int64_t{0}), windowSize);
+        shardRanges[index] = globalToLocal[windowIndex];
     }
 }
 
-// Scan bool flags as int32 counts, then read the count and all shard bounds in one D2H copy.
-// metadataIndices holds global IDs: G, then each shard's boundaries.
+// Scan bool flags as int32 counts, then convert every shard's global bounds into local ID ranges
+// on the device. PyTorch's non-blocking copy from pinned memory keeps the host bounds alive until
+// the copy completes, so no host synchronization is needed. The copy runs on deviceId's current
+// stream, which must be stream.
+template <typename ScalarType>
 void
-scanGaussianRequests(LocalGaussians &local,
-                     const torch::Tensor &metadataIndices,
-                     int32_t *hostMetadata,
+scanGaussianRequests(LocalGaussians<ScalarType> &local,
+                     const torch::Tensor &globalShardBounds,
+                     c10::DeviceIndex deviceId,
                      cudaStream_t stream) {
-    const auto metadata        = makeDeviceBuffer(metadataIndices.sizes(),
-                                           local.globalToLocal.options(),
-                                           local.globalToLocal.get_device(),
-                                           stream);
-    const size_t metadataBytes = metadataIndices.numel() * sizeof(int32_t);
-    C10_CUDA_CHECK(cudaMemcpyAsync(metadata.data_ptr<int32_t>(),
-                                   metadataIndices.const_data_ptr<int32_t>(),
-                                   metadataBytes,
-                                   cudaMemcpyHostToDevice,
-                                   stream));
+    const int64_t numBounds = globalShardBounds.numel();
+    C10_CUDA_CHECK(cudaMallocAsync(&local.shardRanges, numBounds * sizeof(int32_t), stream));
+    at::from_blob(local.shardRanges,
+                  globalShardBounds.sizes(),
+                  globalShardBounds.options().device(c10::Device(c10::kCUDA, deviceId)))
+        .copy_(globalShardBounds, /*non_blocking=*/true);
 
-    const int64_t windowSize = local.requestMask.numel() - 1;
-    auto *globalToLocal      = local.globalToLocal.data_ptr<int32_t>();
     const auto requestFlags =
-        thrust::make_transform_iterator(local.requestMask.data_ptr<bool>(), GaussianRequestFlag{});
-    FVDB_CUB_WRAPPER_ASYNC(
-        stream, cub::DeviceScan::ExclusiveSum, requestFlags, globalToLocal, windowSize + 1);
-    gatherGaussianRequestMetadata<<<GET_BLOCKS(metadata.numel(), 256), 256, 0, stream>>>(
-        globalToLocal,
-        metadata.data_ptr<int32_t>(),
-        metadata.numel(),
-        local.windowBegin,
-        windowSize);
+        thrust::make_transform_iterator(local.requestMask, GaussianRequestFlag{});
+    FVDB_CUB_WRAPPER_ASYNC(stream,
+                           cub::DeviceScan::ExclusiveSum,
+                           requestFlags,
+                           local.globalToLocal,
+                           local.windowSize + 1);
+    gatherShardRanges<<<GET_BLOCKS(numBounds, 256), 256, 0, stream>>>(
+        local.globalToLocal, local.shardRanges, numBounds, local.windowBegin, local.windowSize);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    C10_CUDA_CHECK(cudaMemcpyAsync(hostMetadata,
-                                   metadata.const_data_ptr<int32_t>(),
-                                   metadataBytes,
-                                   cudaMemcpyDeviceToHost,
-                                   stream));
-}
-
-// The exclusive scan assigns local IDs in ascending global-ID order. Only marked entries of
-// globalToLocal are local IDs, so only they are inverted.
-__global__ void
-invertGlobalToLocal(const bool *__restrict__ requestMask,
-                    const int32_t *__restrict__ globalToLocal,
-                    int32_t *__restrict__ localToGlobal,
-                    const int64_t windowBegin,
-                    const int64_t windowSize) {
-    const int64_t windowIndex = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    if (windowIndex < windowSize && requestMask[windowIndex]) {
-        localToGlobal[globalToLocal[windowIndex]] = static_cast<int32_t>(windowBegin + windowIndex);
-    }
 }
 
 struct GaussianInputLayout {
@@ -1539,60 +1504,140 @@ struct GaussianInputLayout {
     int64_t componentStride;
 };
 
-template <typename ScalarType, bool IS_PACKED>
-__global__ void
-gatherLocalGaussianInputKernel(const ScalarType *__restrict__ source,
-                               ScalarType *__restrict__ destination,
-                               const int32_t *__restrict__ localToGlobal,
-                               const GaussianInputLayout layout,
-                               const int64_t numComponents,
-                               const int64_t numElements) {
-    const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    if (index >= numElements) {
-        return;
-    }
-    const int64_t g         = localToGlobal[index / numComponents];
-    const int64_t component = index % numComponents;
-    int64_t sourceOffset;
-    if constexpr (IS_PACKED) {
-        sourceOffset = g * layout.gaussianStride;
-    } else {
-        sourceOffset = (g / layout.gaussiansPerCamera) * layout.cameraStride +
-                       (g % layout.gaussiansPerCamera) * layout.gaussianStride;
-    }
-    destination[index] = source[sourceOffset + component * layout.componentStride];
+// Respect source strides, including broadcast or permuted source views.
+template <bool IS_PACKED>
+GaussianInputLayout
+gaussianInputLayout(const torch::Tensor &source) {
+    constexpr int NUM_OUTER_DIMS = IS_PACKED ? 1 : 2;
+    return {IS_PACKED ? 0 : source.size(1),
+            IS_PACKED ? 0 : source.stride(0),
+            source.stride(NUM_OUTER_DIMS - 1),
+            source.dim() == NUM_OUTER_DIMS ? 0 : source.stride(NUM_OUTER_DIMS)};
 }
 
-// Visit only selected Gaussians, in global-ID order. Respect source strides while writing
-// contiguous local storage, including broadcast or permuted source views.
+// Pointers and component counts for filling local rows. Values are flattened by slot: the global
+// ID, each input, then each gradient, with W values per component; unused gradient slots have no
+// components.
+template <typename ScalarType>
+struct LocalGaussianRows {
+    using Local = LocalGaussians<ScalarType>;
+
+    const ScalarType *inputs[NUM_LOCAL_INPUTS];
+    GaussianInputLayout inputLayouts[NUM_LOCAL_INPUTS];
+    ScalarType *localInputs[NUM_LOCAL_INPUTS];
+    int64_t inputComponents[NUM_LOCAL_INPUTS];
+    ScalarType *localGradients[Local::END];
+    int64_t gradientComponents[Local::END];
+};
+
+// Record each requested Gaussian's global ID, gather its input rows, and zero its gradient rows.
+// The exclusive scan assigns local IDs in ascending global-ID order. Only marked window entries of
+// globalToLocal are local IDs, so unmarked entries are skipped.
 template <typename ScalarType, bool IS_PACKED>
-torch::Tensor
-gatherLocalGaussianInput(const torch::Tensor &source,
-                         const torch::Tensor &localToGlobal,
-                         c10::DeviceIndex deviceId,
-                         cudaStream_t stream) {
-    torch::Tensor destination =
-        makeLocalGaussianBuffer<IS_PACKED>(source, localToGlobal.numel(), deviceId, stream);
-    if (destination.numel() == 0) {
-        return destination;
+__global__ void
+fillLocalGaussiansKernel(const bool *__restrict__ requestMask,
+                         const int32_t *__restrict__ globalToLocal,
+                         int32_t *__restrict__ localToGlobal,
+                         const int64_t windowBegin,
+                         const int64_t windowSize,
+                         const LocalGaussianRows<ScalarType> rows) {
+    using Local = LocalGaussians<ScalarType>;
+
+    const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (index < windowSize) {
+        if (requestMask[index]) {
+            localToGlobal[globalToLocal[index]] = static_cast<int32_t>(windowBegin + index);
+        }
+        return;
     }
-    constexpr int NUM_OUTER_DIMS = IS_PACKED ? 1 : 2;
-    const int64_t numComponents  = source.dim() == NUM_OUTER_DIMS ? 1 : source.size(-1);
-    const GaussianInputLayout layout{
-        IS_PACKED ? 0 : source.size(1),
-        IS_PACKED ? 0 : source.stride(0),
-        source.stride(NUM_OUTER_DIMS - 1),
-        source.dim() == NUM_OUTER_DIMS ? 0 : source.stride(NUM_OUTER_DIMS)};
-    gatherLocalGaussianInputKernel<ScalarType, IS_PACKED>
-        <<<GET_BLOCKS(destination.numel(), 256), 256, 0, stream>>>(
-            source.const_data_ptr<ScalarType>(),
-            destination.data_ptr<ScalarType>(),
-            localToGlobal.const_data_ptr<int32_t>(),
-            layout,
-            numComponents,
-            destination.numel());
+
+    int64_t valuesBegin = windowSize;
+    // Unroll so each slot is read at a constant parameter offset.
+#pragma unroll
+    for (size_t inputIndex = 0; inputIndex < NUM_LOCAL_INPUTS; ++inputIndex) {
+        const int64_t numComponents = rows.inputComponents[inputIndex];
+        const int64_t valuesEnd     = valuesBegin + windowSize * numComponents;
+        if (index >= valuesBegin && index < valuesEnd) {
+            const int64_t windowIndex = (index - valuesBegin) / numComponents;
+            if (requestMask[windowIndex]) {
+                const int64_t component = (index - valuesBegin) % numComponents;
+                const int64_t g         = windowBegin + windowIndex;
+                const auto &layout      = rows.inputLayouts[inputIndex];
+                int64_t sourceOffset;
+                if constexpr (IS_PACKED) {
+                    sourceOffset = g * layout.gaussianStride;
+                } else {
+                    sourceOffset = (g / layout.gaussiansPerCamera) * layout.cameraStride +
+                                   (g % layout.gaussiansPerCamera) * layout.gaussianStride;
+                }
+                const int64_t localIndex =
+                    int64_t{globalToLocal[windowIndex]} * numComponents + component;
+                rows.localInputs[inputIndex][localIndex] =
+                    rows.inputs[inputIndex][sourceOffset + component * layout.componentStride];
+            }
+        }
+        valuesBegin = valuesEnd;
+    }
+#pragma unroll
+    for (size_t gradientIndex = 0; gradientIndex < Local::END; ++gradientIndex) {
+        const int64_t numComponents = rows.gradientComponents[gradientIndex];
+        const int64_t valuesEnd     = valuesBegin + windowSize * numComponents;
+        if (index >= valuesBegin && index < valuesEnd) {
+            const int64_t windowIndex = (index - valuesBegin) / numComponents;
+            if (requestMask[windowIndex]) {
+                const int64_t component = (index - valuesBegin) % numComponents;
+                const int64_t localIndex =
+                    int64_t{globalToLocal[windowIndex]} * numComponents + component;
+                rows.localGradients[gradientIndex][localIndex] = ScalarType{0};
+            }
+        }
+        valuesBegin = valuesEnd;
+    }
+}
+
+// Allocate window-capacity local rows on the device's current stream and fill the first U rows in
+// one launch. Inputs follow RasterizeBackwardArgs order: means2d, conics, opacities, features.
+template <typename ScalarType, bool IS_PACKED>
+void
+fillLocalGaussians(LocalGaussians<ScalarType> &local,
+                   const std::vector<torch::Tensor> &inputs,
+                   const std::vector<torch::Tensor> &globalGradients,
+                   cudaStream_t stream) {
+    TORCH_INTERNAL_ASSERT(inputs.size() == NUM_LOCAL_INPUTS);
+    C10_CUDA_CHECK(
+        cudaMallocAsync(&local.localToGlobal, local.windowSize * sizeof(int32_t), stream));
+    LocalGaussianRows<ScalarType> rows{};
+    int64_t rowComponents = 1; // The global ID
+    for (size_t inputIndex = 0; inputIndex < NUM_LOCAL_INPUTS; ++inputIndex) {
+        const auto &input           = inputs[inputIndex];
+        const int64_t numComponents = gaussianComponents<IS_PACKED>(input);
+        C10_CUDA_CHECK(cudaMallocAsync(&local.inputs[inputIndex],
+                                       local.windowSize * numComponents * sizeof(ScalarType),
+                                       stream));
+        rows.inputs[inputIndex]          = input.const_data_ptr<ScalarType>();
+        rows.inputLayouts[inputIndex]    = gaussianInputLayout<IS_PACKED>(input);
+        rows.localInputs[inputIndex]     = local.inputs[inputIndex];
+        rows.inputComponents[inputIndex] = numComponents;
+        rowComponents += numComponents;
+    }
+    for (size_t gradientIndex = 0; gradientIndex < globalGradients.size(); ++gradientIndex) {
+        const int64_t numComponents = gaussianComponents<IS_PACKED>(globalGradients[gradientIndex]);
+        C10_CUDA_CHECK(cudaMallocAsync(&local.gradients[gradientIndex],
+                                       local.windowSize * numComponents * sizeof(ScalarType),
+                                       stream));
+        rows.localGradients[gradientIndex]     = local.gradients[gradientIndex];
+        rows.gradientComponents[gradientIndex] = numComponents;
+        rowComponents += numComponents;
+    }
+    fillLocalGaussiansKernel<ScalarType, IS_PACKED>
+        <<<GET_BLOCKS(local.windowSize * rowComponents, 256), 256, 0, stream>>>(
+            local.requestMask,
+            local.globalToLocal,
+            local.localToGlobal,
+            local.windowBegin,
+            local.windowSize,
+            rows);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return destination;
 }
 
 // Each GPU gathers local copies of the Gaussians its tiles request. Each GPU then runs the same
@@ -1675,10 +1720,11 @@ callRasterizeBackwardPrivateUse1(
         globalGradients.emplace_back(outDLossDMeans2dAbs);
     }
 
+    using Local = LocalGaussians<ScalarType>;
     std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
-    // Keep each device's current compute stream unchanged through allocation, rasterization,
-    // reduction, and release: the owning tensors enqueue their frees on their allocation streams.
-    std::vector<LocalGaussians> localGaussians(c10::cuda::device_count());
+    // Keep each device's current compute stream unchanged from allocation through release:
+    // every raw allocation is freed on the stream that allocated it.
+    std::vector<Local> localGaussians(c10::cuda::device_count());
 
     // Prefetch inputs after prior work, then make the current streams wait for those inputs.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
@@ -1732,30 +1778,19 @@ callRasterizeBackwardPrivateUse1(
     };
     const std::vector<GradientShard> gradientShards =
         makeGradientShards<IS_PACKED>(globalGradients, numGaussians);
-    const int64_t numGradientShards = gradientShards.size();
-    const int64_t numMetadataValues = 1 + 2 * numGradientShards;
-    const auto metadataOptions =
-        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
-    // Every device reads the same scan positions: total count, then [begin, end) for each shard.
-    // Keep this pinned index table alive until all H2D copies have completed.
-    auto metadataIndices = torch::empty({numMetadataValues}, metadataOptions);
-    auto *metadataIndicesPtr = metadataIndices.data_ptr<int32_t>();
-    metadataIndicesPtr[0] = static_cast<int32_t>(numGaussians);
+    // Every device converts the same global shard bounds into its local ID ranges on the device.
+    auto globalShardBounds =
+        torch::empty({static_cast<int64_t>(gradientShards.size()), 2},
+                     torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+    auto shardBounds = globalShardBounds.accessor<int32_t, 2>();
     for (size_t shardIndex = 0; shardIndex < gradientShards.size(); ++shardIndex) {
-        metadataIndicesPtr[1 + 2 * shardIndex] =
-            static_cast<int32_t>(gradientShards[shardIndex].firstGaussian);
-        metadataIndicesPtr[2 + 2 * shardIndex] =
-            static_cast<int32_t>(gradientShards[shardIndex].endGaussian);
+        shardBounds[shardIndex][0] = static_cast<int32_t>(gradientShards[shardIndex].firstGaussian);
+        shardBounds[shardIndex][1] = static_cast<int32_t>(gradientShards[shardIndex].endGaussian);
     }
-    // One contiguous pinned destination per device; devices without tiles retain zero metadata.
-    auto hostMetadata =
-        torch::zeros({c10::cuda::device_count(), numMetadataValues}, metadataOptions);
-    auto requestMetadata = hostMetadata.accessor<int32_t, 2>();
-    const torch::Tensor hostShardOffsets =
-        hostMetadata.narrow(1, 1, 2 * numGradientShards)
-            .view({c10::cuda::device_count(), numGradientShards, 2});
-    auto shardOffsets = hostShardOffsets.accessor<int32_t, 3>();
-    // Enqueue every device's scan and readback before waiting for any allocation counts.
+    const std::vector<torch::Tensor> inputs = {means2d, conics, opacities, features};
+
+    // Queue request marking, local rows, and rasterization on every device without waiting on the
+    // host: local rows have window capacity, and the reduction reads shard ranges on the device.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -1766,13 +1801,75 @@ callRasterizeBackwardPrivateUse1(
         if (deviceTileCount) {
             // Validate pixel inputs before marking reads lastGaussianIds. Output tensors are only
             // shape metadata here; the marking kernel receives no gradient accessors.
-            RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
-                means2d,
-                conics,
-                opacities,
-                features,
-                backgrounds,
-                masks,
+            RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED>
+                requestArgs(means2d,
+                            conics,
+                            opacities,
+                            features,
+                            backgrounds,
+                            masks,
+                            renderWindow,
+                            tileSize,
+                            deviceTileOffset,
+                            tileOffsets,
+                            tileGaussianIds,
+                            reshapedRenderedAlphas,
+                            reshapedLastGaussianIds,
+                            reshapedDLossDRenderedFeatures,
+                            reshapedDLossDRenderedAlphas,
+                            outDLossDMeans2d,
+                            outDLossDConics,
+                            outDLossDFeatures,
+                            outDLossDOpacities,
+                            absGrad ? std::make_optional(outDLossDMeans2dAbs) : std::nullopt,
+                            activeTiles,
+                            tilePixelMask,
+                            tilePixelCumsum,
+                            pixelMap);
+            auto &local = localGaussians[deviceId];
+            int64_t windowEnd;
+            std::tie(local.windowBegin, windowEnd) =
+                requestWindow(deviceTileOffset, deviceTileCount);
+            local.windowSize           = windowEnd - local.windowBegin;
+            const size_t numMapEntries = local.windowSize + 1;
+            C10_CUDA_CHECK(
+                cudaMallocAsync(&local.requestMask, numMapEntries * sizeof(bool), stream));
+            C10_CUDA_CHECK(
+                cudaMallocAsync(&local.globalToLocal, numMapEntries * sizeof(int32_t), stream));
+            C10_CUDA_CHECK(
+                cudaMemsetAsync(local.requestMask, 0, numMapEntries * sizeof(bool), stream));
+
+            const dim3 blockDim = {tileSize, tileSize, 1};
+            const dim3 gridDim  = {deviceTileCount, 1, 1};
+            markRequestedGaussians<ScalarType, NUM_CHANNELS, IS_PACKED>
+                <<<gridDim, blockDim, 0, stream>>>(requestArgs.commonArgs,
+                                                   requestArgs.mLastGaussianIds,
+                                                   local.requestMask,
+                                                   local.windowBegin);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            scanGaussianRequests(local, globalShardBounds, deviceId, stream);
+            fillLocalGaussians<ScalarType, IS_PACKED>(local, inputs, globalGradients, stream);
+            C10_CUDA_CHECK(cudaFreeAsync(local.requestMask, stream));
+            local.requestMask = nullptr;
+
+            // Local input and gradient rows share the existing packed layout. The global source
+            // layout is needed only for gathering attributes and assigning output owners.
+            // Backgrounds and masks were validated before request marking. Attach them below;
+            // packed sparse inputs have no camera count for repeating their shape checks.
+            const int64_t numRows = local.windowSize;
+            const auto gradientView = [&](typename Local::Gradient gradient,
+                                          const torch::Tensor &globalGradient) {
+                return localGaussianView<IS_PACKED>(
+                    local.gradients[gradient], globalGradient, numRows, deviceId);
+            };
+            RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true> args(
+                localGaussianView<IS_PACKED>(local.inputs[0], means2d, numRows, deviceId),
+                localGaussianView<IS_PACKED>(local.inputs[1], conics, numRows, deviceId),
+                localGaussianView<IS_PACKED>(local.inputs[2], opacities, numRows, deviceId),
+                localGaussianView<IS_PACKED>(local.inputs[3], features, numRows, deviceId),
+                std::nullopt,
+                std::nullopt,
                 renderWindow,
                 tileSize,
                 deviceTileOffset,
@@ -1782,42 +1879,58 @@ callRasterizeBackwardPrivateUse1(
                 reshapedLastGaussianIds,
                 reshapedDLossDRenderedFeatures,
                 reshapedDLossDRenderedAlphas,
-                outDLossDMeans2d,
-                outDLossDConics,
-                outDLossDFeatures,
-                outDLossDOpacities,
-                absGrad ? std::make_optional(outDLossDMeans2dAbs) : std::nullopt,
+                gradientView(Local::MEANS2D, outDLossDMeans2d),
+                gradientView(Local::CONICS, outDLossDConics),
+                gradientView(Local::FEATURES, outDLossDFeatures),
+                gradientView(Local::OPACITIES, outDLossDOpacities),
+                absGrad ? std::make_optional(gradientView(Local::MEANS2D_ABS, outDLossDMeans2dAbs))
+                        : std::nullopt,
                 activeTiles,
                 tilePixelMask,
                 tilePixelCumsum,
                 pixelMap);
-            auto &local = localGaussians[deviceId];
-            int64_t windowEnd;
-            std::tie(local.windowBegin, windowEnd) =
-                requestWindow(deviceTileOffset, deviceTileCount);
-            const int64_t windowSize = windowEnd - local.windowBegin;
-            local.requestMask        = makeDeviceBuffer(
-                {windowSize + 1}, opacities.options().dtype(torch::kBool), deviceId, stream);
-            local.globalToLocal = makeDeviceBuffer(
-                {windowSize + 1}, opacities.options().dtype(torch::kInt32), deviceId, stream);
-            auto *requestMask = local.requestMask.data_ptr<bool>();
-            C10_CUDA_CHECK(
-                cudaMemsetAsync(requestMask, 0, (windowSize + 1) * sizeof(bool), stream));
+            args.mGlobalToLocal      = local.globalToLocal;
+            args.mGlobalToLocalBegin = local.windowBegin;
+            if (backgrounds.has_value()) {
+                args.commonArgs.mBackgrounds =
+                    initAccessor<ScalarType, 2>(backgrounds.value(), "backgrounds");
+                args.commonArgs.mHasBackgrounds = true;
+            }
+            if (masks.has_value()) {
+                args.commonArgs.mMasks    = initAccessor<bool, 3>(masks.value(), "masks");
+                args.commonArgs.mHasMasks = true;
+            }
 
-            const dim3 blockDim = {tileSize, tileSize, 1};
-            const dim3 gridDim  = {deviceTileCount, 1, 1};
-            markRequestedGaussians<ScalarType, NUM_CHANNELS, IS_PACKED>
-                <<<gridDim, blockDim, 0, stream>>>(
-                    args.commonArgs, args.mLastGaussianIds, requestMask, local.windowBegin);
+            const size_t numChannels =
+                (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
+            const size_t sharedMemSize =
+                getSharedMemRequirements<ScalarType>(numChannels, tileSize);
+
+            if (cudaFuncSetAttribute(
+                    rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    sharedMemSize) != cudaSuccess) {
+                AT_ERROR("Failed to set maximum shared memory size (requested ",
+                         sharedMemSize,
+                         " bytes), try lowering tileSize.");
+            }
+
+            // Marking, filling, rasterization, and frees use the same stream. The tile cutoff
+            // ensures every loaded global ID has a populated local slot.
+            rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>
+                <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-            scanGaussianRequests(local, metadataIndices, requestMetadata[deviceId].data(), stream);
+            C10_CUDA_CHECK(cudaFreeAsync(local.globalToLocal, stream));
+            local.globalToLocal = nullptr;
+            for (auto &input: local.inputs) {
+                C10_CUDA_CHECK(cudaFreeAsync(input, stream));
+                input = nullptr;
+            }
         }
     }
 
-    // Submit every output prefetch before the count readback can block the host launch thread.
     // Reuse the input prefetch streams to preserve their ordering. Rasterization writes local
-    // gradients, so only the reduction needs to wait for output placement.
+    // gradients, so only the reduction waits for output placement.
     std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -1845,123 +1958,6 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
     }
 
-    // Counts must reach the host before exact-size allocation. All scans and count copies above
-    // are already enqueued, so one device can gather and rasterize while another finishes its scan.
-    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-
-        uint32_t deviceTileOffset, deviceTileCount;
-        std::tie(deviceTileOffset, deviceTileCount) =
-            deviceAlignedChunk(tileAlignment, tileCount, deviceId);
-
-        if (deviceTileCount) {
-            auto &local = localGaussians[deviceId];
-            C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-            const int64_t numRequested = requestMetadata[deviceId][0];
-            if (numRequested) {
-                // Build the inverse map for gathering inputs and scattering gradients to their
-                // owners.
-                local.localToGlobal = makeDeviceBuffer(
-                    {numRequested}, opacities.options().dtype(torch::kInt32), deviceId, stream);
-                const auto *globalToLocal = local.globalToLocal.const_data_ptr<int32_t>();
-                const int64_t windowSize  = local.globalToLocal.numel() - 1;
-                invertGlobalToLocal<<<GET_BLOCKS(windowSize, 256), 256, 0, stream>>>(
-                    local.requestMask.const_data_ptr<bool>(),
-                    globalToLocal,
-                    local.localToGlobal.data_ptr<int32_t>(),
-                    local.windowBegin,
-                    windowSize);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-                local.requestMask = torch::Tensor();
-
-                const auto localMeans2d = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-                    means2d, local.localToGlobal, deviceId, stream);
-                const auto localConics = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-                    conics, local.localToGlobal, deviceId, stream);
-                const auto localOpacities = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-                    opacities, local.localToGlobal, deviceId, stream);
-                const auto localFeatures = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-                    features, local.localToGlobal, deviceId, stream);
-                local.gradients = makeLocalGaussianGradients<IS_PACKED>(
-                    globalGradients, numRequested, deviceId, stream);
-
-                // Local input and gradient tensors share the existing packed layout. The global
-                // source layout is needed only for gathering attributes and assigning output
-                // owners. Backgrounds and masks were validated before request marking. Attach
-                // them below; packed sparse inputs have no camera count for repeating their shape
-                // checks.
-                RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true> args(
-                    localMeans2d,
-                    localConics,
-                    localOpacities,
-                    localFeatures,
-                    std::nullopt,
-                    std::nullopt,
-                    renderWindow,
-                    tileSize,
-                    deviceTileOffset,
-                    tileOffsets,
-                    tileGaussianIds,
-                    reshapedRenderedAlphas,
-                    reshapedLastGaussianIds,
-                    reshapedDLossDRenderedFeatures,
-                    reshapedDLossDRenderedAlphas,
-                    local.gradients[LocalGaussians::MEANS2D],
-                    local.gradients[LocalGaussians::CONICS],
-                    local.gradients[LocalGaussians::FEATURES],
-                    local.gradients[LocalGaussians::OPACITIES],
-                    absGrad ? std::make_optional(local.gradients[LocalGaussians::MEANS2D_ABS])
-                            : std::nullopt,
-                    activeTiles,
-                    tilePixelMask,
-                    tilePixelCumsum,
-                    pixelMap);
-                args.mGlobalToLocal      = globalToLocal;
-                args.mGlobalToLocalBegin = local.windowBegin;
-                if (backgrounds.has_value()) {
-                    args.commonArgs.mBackgrounds =
-                        initAccessor<ScalarType, 2>(backgrounds.value(), "backgrounds");
-                    args.commonArgs.mHasBackgrounds = true;
-                }
-                if (masks.has_value()) {
-                    args.commonArgs.mMasks    = initAccessor<bool, 3>(masks.value(), "masks");
-                    args.commonArgs.mHasMasks = true;
-                }
-
-                const size_t numChannels =
-                    (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
-                const size_t sharedMemSize =
-                    getSharedMemRequirements<ScalarType>(numChannels, tileSize);
-
-                if (cudaFuncSetAttribute(
-                        rasterizeGaussiansBackward<ScalarType,
-                                                   NUM_CHANNELS,
-                                                   NUM_SHARED_CHANNELS,
-                                                   true>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        sharedMemSize) != cudaSuccess) {
-                    AT_ERROR("Failed to set maximum shared memory size (requested ",
-                             sharedMemSize,
-                             " bytes), try lowering tileSize.");
-                }
-
-                const dim3 blockDim = {tileSize, tileSize, 1};
-                const dim3 gridDim  = {deviceTileCount, 1, 1};
-
-                // Marking, inversion, gathering, rasterization, and frees use the same stream.
-                // The tile cutoff ensures every loaded global ID has a populated local slot.
-                rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>
-                    <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-                local.globalToLocal = torch::Tensor();
-            } else {
-                local.requestMask   = torch::Tensor();
-                local.globalToLocal = torch::Tensor();
-            }
-        }
-    }
-
     // Scatter-add reductions wait for output prefetching after rasterization has been submitted.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -1975,12 +1971,25 @@ callRasterizeBackwardPrivateUse1(
     mergeStreams();
 
     reduceScatterGradients<ScalarType, IS_PACKED>(
-        gradientShards, shardOffsets, localGaussians, globalGradients, numGaussians);
+        gradientShards, localGaussians, globalGradients, numGaussians);
 
     // Remote reads run on destination streams. Order each source stream after those reads
-    // before its tensors enqueue frees, and expose completed output writes to every device.
+    // before its buffers are freed, and expose completed output writes to every device.
     mergeStreams();
-    localGaussians.clear();
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        auto &local = localGaussians[deviceId];
+        if (local.localToGlobal) {
+            C10_CUDA_CHECK(cudaSetDevice(deviceId));
+            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+            C10_CUDA_CHECK(cudaFreeAsync(local.shardRanges, stream));
+            C10_CUDA_CHECK(cudaFreeAsync(local.localToGlobal, stream));
+            for (auto *gradient: local.gradients) {
+                if (gradient) {
+                    C10_CUDA_CHECK(cudaFreeAsync(gradient, stream));
+                }
+            }
+        }
+    }
 
     return std::make_tuple(outDLossDMeans2dAbs,
                            outDLossDMeans2d,
