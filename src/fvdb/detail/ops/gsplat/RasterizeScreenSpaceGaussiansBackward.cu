@@ -1342,39 +1342,40 @@ reduceScatterGradients(const std::vector<GradientShard> &shards,
             const auto offsets  = shardOffsets[sourceId][shardIndex];
             const int64_t begin = offsets[0];
             const int64_t count = offsets[1] - begin;
-            if (count == 0) {
-                continue;
+            if (count) {
+                const auto &source      = localGaussians[sourceId];
+                const int64_t numValues = count * shard.numComponents;
+                const auto *ids         = source.localToGlobal.const_data_ptr<int32_t>() + begin;
+                const auto *values =
+                    source.gradients[shard.tensorIndex].const_data_ptr<ScalarType>() +
+                    begin * shard.numComponents;
+                if (sourceId != shard.ownerId) {
+                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedIds.data_ptr<int32_t>(),
+                                                       shard.ownerId,
+                                                       ids,
+                                                       sourceId,
+                                                       count * sizeof(int32_t),
+                                                       stream));
+                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedGradients.data_ptr<ScalarType>(),
+                                                       shard.ownerId,
+                                                       values,
+                                                       sourceId,
+                                                       numValues * sizeof(ScalarType),
+                                                       stream));
+                    ids    = receivedIds.const_data_ptr<int32_t>();
+                    values = receivedGradients.const_data_ptr<ScalarType>();
+                }
+                scatterAddLocalGradients<ScalarType>
+                    <<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
+                        ids,
+                        values,
+                        outputPtr,
+                        numValues,
+                        shard.numComponents,
+                        shard.firstElement,
+                        shard.firstElement + shard.numElements);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
-            const auto &source      = localGaussians[sourceId];
-            const int64_t numValues = count * shard.numComponents;
-            const auto *ids         = source.localToGlobal.const_data_ptr<int32_t>() + begin;
-            const auto *values = source.gradients[shard.tensorIndex].const_data_ptr<ScalarType>() +
-                                 begin * shard.numComponents;
-            if (sourceId != shard.ownerId) {
-                C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedIds.data_ptr<int32_t>(),
-                                                   shard.ownerId,
-                                                   ids,
-                                                   sourceId,
-                                                   count * sizeof(int32_t),
-                                                   stream));
-                C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedGradients.data_ptr<ScalarType>(),
-                                                   shard.ownerId,
-                                                   values,
-                                                   sourceId,
-                                                   numValues * sizeof(ScalarType),
-                                                   stream));
-                ids    = receivedIds.const_data_ptr<int32_t>();
-                values = receivedGradients.const_data_ptr<ScalarType>();
-            }
-            scatterAddLocalGradients<ScalarType><<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
-                ids,
-                values,
-                outputPtr,
-                numValues,
-                shard.numComponents,
-                shard.firstElement,
-                shard.firstElement + shard.numElements);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     }
 }
@@ -1649,7 +1650,7 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
         C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], prefetchEvent));
 
-        int64_t deviceTileOffset, deviceTileCount;
+        uint32_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) =
             deviceAlignedChunk(tileAlignment, tileCount, deviceId);
         if (deviceTileCount) {
@@ -1708,52 +1709,52 @@ callRasterizeBackwardPrivateUse1(
         uint32_t deviceTileOffset, deviceTileCount;
         std::tie(deviceTileOffset, deviceTileCount) =
             deviceAlignedChunk(tileAlignment, tileCount, deviceId);
-        if (deviceTileCount == 0) {
-            continue;
+        if (deviceTileCount) {
+            // Validate pixel inputs before marking reads lastGaussianIds. Output tensors are only
+            // shape metadata here; the marking kernel receives no gradient accessors.
+            RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
+                means2d,
+                conics,
+                opacities,
+                features,
+                backgrounds,
+                masks,
+                renderWindow,
+                tileSize,
+                deviceTileOffset,
+                tileOffsets,
+                tileGaussianIds,
+                reshapedRenderedAlphas,
+                reshapedLastGaussianIds,
+                reshapedDLossDRenderedFeatures,
+                reshapedDLossDRenderedAlphas,
+                outDLossDMeans2d,
+                outDLossDConics,
+                outDLossDFeatures,
+                outDLossDOpacities,
+                absGrad ? std::make_optional(outDLossDMeans2dAbs) : std::nullopt,
+                activeTiles,
+                tilePixelMask,
+                tilePixelCumsum,
+                pixelMap);
+            auto &local       = localGaussians[deviceId];
+            local.requestMask = makeDeviceBuffer(
+                {numGaussians + 1}, opacities.options().dtype(torch::kBool), deviceId, stream);
+            local.globalToLocal = makeDeviceBuffer(
+                {numGaussians + 1}, opacities.options().dtype(torch::kInt32), deviceId, stream);
+            auto *requestMask = local.requestMask.data_ptr<bool>();
+            C10_CUDA_CHECK(
+                cudaMemsetAsync(requestMask, 0, (numGaussians + 1) * sizeof(bool), stream));
+
+            const dim3 blockDim = {tileSize, tileSize, 1};
+            const dim3 gridDim  = {deviceTileCount, 1, 1};
+            markRequestedGaussians<ScalarType, NUM_CHANNELS, IS_PACKED>
+                <<<gridDim, blockDim, 0, stream>>>(
+                    args.commonArgs, args.mLastGaussianIds, requestMask);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            scanGaussianRequests(local, metadataIndices, requestMetadata[deviceId].data(), stream);
         }
-
-        // Validate pixel inputs before marking reads lastGaussianIds. Output tensors are only
-        // shape metadata here; the marking kernel receives no gradient accessors.
-        RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, IS_PACKED> args(
-            means2d,
-            conics,
-            opacities,
-            features,
-            backgrounds,
-            masks,
-            renderWindow,
-            tileSize,
-            deviceTileOffset,
-            tileOffsets,
-            tileGaussianIds,
-            reshapedRenderedAlphas,
-            reshapedLastGaussianIds,
-            reshapedDLossDRenderedFeatures,
-            reshapedDLossDRenderedAlphas,
-            outDLossDMeans2d,
-            outDLossDConics,
-            outDLossDFeatures,
-            outDLossDOpacities,
-            absGrad ? std::make_optional(outDLossDMeans2dAbs) : std::nullopt,
-            activeTiles,
-            tilePixelMask,
-            tilePixelCumsum,
-            pixelMap);
-        auto &local       = localGaussians[deviceId];
-        local.requestMask = makeDeviceBuffer(
-            {numGaussians + 1}, opacities.options().dtype(torch::kBool), deviceId, stream);
-        local.globalToLocal = makeDeviceBuffer(
-            {numGaussians + 1}, opacities.options().dtype(torch::kInt32), deviceId, stream);
-        auto *requestMask = local.requestMask.data_ptr<bool>();
-        C10_CUDA_CHECK(cudaMemsetAsync(requestMask, 0, (numGaussians + 1) * sizeof(bool), stream));
-
-        const dim3 blockDim = {tileSize, tileSize, 1};
-        const dim3 gridDim  = {deviceTileCount, 1, 1};
-        markRequestedGaussians<ScalarType, NUM_CHANNELS, IS_PACKED>
-            <<<gridDim, blockDim, 0, stream>>>(args.commonArgs, args.mLastGaussianIds, requestMask);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-        scanGaussianRequests(local, metadataIndices, requestMetadata[deviceId].data(), stream);
     }
 
     // Submit every output prefetch before the count readback can block the host launch thread.
@@ -1789,104 +1790,108 @@ callRasterizeBackwardPrivateUse1(
         std::tie(deviceTileOffset, deviceTileCount) =
             deviceAlignedChunk(tileAlignment, tileCount, deviceId);
 
-        if (deviceTileCount == 0) {
-            continue;
+        if (deviceTileCount) {
+            auto &local = localGaussians[deviceId];
+            C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+            const int64_t numRequested = requestMetadata[deviceId][0];
+            if (numRequested) {
+                // Build the inverse map for gathering inputs and scattering gradients to their
+                // owners.
+                local.localToGlobal = makeDeviceBuffer(
+                    {numRequested}, opacities.options().dtype(torch::kInt32), deviceId, stream);
+                const auto *globalToLocal = local.globalToLocal.const_data_ptr<int32_t>();
+                invertGlobalToLocal<<<GET_BLOCKS(numGaussians, 256), 256, 0, stream>>>(
+                    local.requestMask.const_data_ptr<bool>(),
+                    globalToLocal,
+                    local.localToGlobal.data_ptr<int32_t>(),
+                    numGaussians);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                local.requestMask = torch::Tensor();
+
+                const auto localMeans2d = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+                    means2d, local.localToGlobal, deviceId, stream);
+                const auto localConics = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+                    conics, local.localToGlobal, deviceId, stream);
+                const auto localOpacities = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+                    opacities, local.localToGlobal, deviceId, stream);
+                const auto localFeatures = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+                    features, local.localToGlobal, deviceId, stream);
+                local.gradients = makeLocalGaussianGradients<IS_PACKED>(
+                    globalGradients, numRequested, deviceId, stream);
+
+                // Local input and gradient tensors share the existing packed layout. The global
+                // source layout is needed only for gathering attributes and assigning output
+                // owners. Backgrounds and masks were validated before request marking. Attach
+                // them below; packed sparse inputs have no camera count for repeating their shape
+                // checks.
+                RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true> args(
+                    localMeans2d,
+                    localConics,
+                    localOpacities,
+                    localFeatures,
+                    std::nullopt,
+                    std::nullopt,
+                    renderWindow,
+                    tileSize,
+                    deviceTileOffset,
+                    tileOffsets,
+                    tileGaussianIds,
+                    reshapedRenderedAlphas,
+                    reshapedLastGaussianIds,
+                    reshapedDLossDRenderedFeatures,
+                    reshapedDLossDRenderedAlphas,
+                    local.gradients[LocalGaussians::MEANS2D],
+                    local.gradients[LocalGaussians::CONICS],
+                    local.gradients[LocalGaussians::FEATURES],
+                    local.gradients[LocalGaussians::OPACITIES],
+                    absGrad ? std::make_optional(local.gradients[LocalGaussians::MEANS2D_ABS])
+                            : std::nullopt,
+                    activeTiles,
+                    tilePixelMask,
+                    tilePixelCumsum,
+                    pixelMap);
+                args.mGlobalToLocal = globalToLocal;
+                if (backgrounds.has_value()) {
+                    args.commonArgs.mBackgrounds =
+                        initAccessor<ScalarType, 2>(backgrounds.value(), "backgrounds");
+                    args.commonArgs.mHasBackgrounds = true;
+                }
+                if (masks.has_value()) {
+                    args.commonArgs.mMasks    = initAccessor<bool, 3>(masks.value(), "masks");
+                    args.commonArgs.mHasMasks = true;
+                }
+
+                const size_t numChannels =
+                    (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
+                const size_t sharedMemSize =
+                    getSharedMemRequirements<ScalarType>(numChannels, tileSize);
+
+                if (cudaFuncSetAttribute(
+                        rasterizeGaussiansBackward<ScalarType,
+                                                   NUM_CHANNELS,
+                                                   NUM_SHARED_CHANNELS,
+                                                   true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        sharedMemSize) != cudaSuccess) {
+                    AT_ERROR("Failed to set maximum shared memory size (requested ",
+                             sharedMemSize,
+                             " bytes), try lowering tileSize.");
+                }
+
+                const dim3 blockDim = {tileSize, tileSize, 1};
+                const dim3 gridDim  = {deviceTileCount, 1, 1};
+
+                // Marking, inversion, gathering, rasterization, and frees use the same stream.
+                // The tile cutoff ensures every loaded global ID has a populated local slot.
+                rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>
+                    <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                local.globalToLocal = torch::Tensor();
+            } else {
+                local.requestMask   = torch::Tensor();
+                local.globalToLocal = torch::Tensor();
+            }
         }
-        auto &local = localGaussians[deviceId];
-        C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-        const int64_t numRequested = requestMetadata[deviceId][0];
-        if (numRequested == 0) {
-            local.requestMask   = torch::Tensor();
-            local.globalToLocal = torch::Tensor();
-            continue;
-        }
-
-        // Build the inverse map for gathering inputs and scattering gradients to their owners.
-        local.localToGlobal = makeDeviceBuffer(
-            {numRequested}, opacities.options().dtype(torch::kInt32), deviceId, stream);
-        const auto *globalToLocal = local.globalToLocal.const_data_ptr<int32_t>();
-        invertGlobalToLocal<<<GET_BLOCKS(numGaussians, 256), 256, 0, stream>>>(
-            local.requestMask.const_data_ptr<bool>(),
-            globalToLocal,
-            local.localToGlobal.data_ptr<int32_t>(),
-            numGaussians);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        local.requestMask = torch::Tensor();
-
-        const auto localMeans2d = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-            means2d, local.localToGlobal, deviceId, stream);
-        const auto localConics = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-            conics, local.localToGlobal, deviceId, stream);
-        const auto localOpacities = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-            opacities, local.localToGlobal, deviceId, stream);
-        const auto localFeatures = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
-            features, local.localToGlobal, deviceId, stream);
-        local.gradients =
-            makeLocalGaussianGradients<IS_PACKED>(globalGradients, numRequested, deviceId, stream);
-
-        // Local input and gradient tensors share the existing packed layout. The global
-        // source layout is needed only for gathering attributes and assigning output owners.
-        // Backgrounds and masks were validated before request marking. Attach them below;
-        // packed sparse inputs have no camera count for repeating their shape checks.
-        RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true> args(
-            localMeans2d,
-            localConics,
-            localOpacities,
-            localFeatures,
-            std::nullopt,
-            std::nullopt,
-            renderWindow,
-            tileSize,
-            deviceTileOffset,
-            tileOffsets,
-            tileGaussianIds,
-            reshapedRenderedAlphas,
-            reshapedLastGaussianIds,
-            reshapedDLossDRenderedFeatures,
-            reshapedDLossDRenderedAlphas,
-            local.gradients[LocalGaussians::MEANS2D],
-            local.gradients[LocalGaussians::CONICS],
-            local.gradients[LocalGaussians::FEATURES],
-            local.gradients[LocalGaussians::OPACITIES],
-            absGrad ? std::make_optional(local.gradients[LocalGaussians::MEANS2D_ABS])
-                    : std::nullopt,
-            activeTiles,
-            tilePixelMask,
-            tilePixelCumsum,
-            pixelMap);
-        args.mGlobalToLocal = globalToLocal;
-        if (backgrounds.has_value()) {
-            args.commonArgs.mBackgrounds =
-                initAccessor<ScalarType, 2>(backgrounds.value(), "backgrounds");
-            args.commonArgs.mHasBackgrounds = true;
-        }
-        if (masks.has_value()) {
-            args.commonArgs.mMasks    = initAccessor<bool, 3>(masks.value(), "masks");
-            args.commonArgs.mHasMasks = true;
-        }
-
-        const size_t numChannels =
-            (NUM_SHARED_CHANNELS == NUM_CHANNELS) ? NUM_CHANNELS : NUM_SHARED_CHANNELS + 1;
-        const size_t sharedMemSize = getSharedMemRequirements<ScalarType>(numChannels, tileSize);
-
-        if (cudaFuncSetAttribute(
-                rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                sharedMemSize) != cudaSuccess) {
-            AT_ERROR("Failed to set maximum shared memory size (requested ",
-                     sharedMemSize,
-                     " bytes), try lowering tileSize.");
-        }
-
-        const dim3 blockDim = {tileSize, tileSize, 1};
-        const dim3 gridDim  = {deviceTileCount, 1, 1};
-
-        // Marking, inversion, gathering, rasterization, and frees use the same stream.
-        // The tile cutoff ensures every loaded global ID has a populated local slot.
-        rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>
-            <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        local.globalToLocal = torch::Tensor();
     }
 
     // Scatter-add reductions wait for output prefetching after rasterization has been submitted.
