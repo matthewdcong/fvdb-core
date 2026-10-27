@@ -1306,7 +1306,7 @@ scatterAddLocalGradients(const int32_t *__restrict__ localToGlobal,
 
 // Every source list contains unique sorted IDs. Sources are accumulated sequentially on the
 // owner's stream, so scatter-add needs no atomics. The caller orders all source producers and
-// output discard-prefetches before this function, and all remote reads before source frees.
+// each owner's output discard-prefetch before this function, and remote reads before source frees.
 template <typename ScalarType>
 void
 reduceScatterGradients(const std::vector<GradientShard> &shards,
@@ -1897,8 +1897,8 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    // Every local gradient producer must precede remote copies. Finish every discard-prefetch
-    // before writing managed outputs, including boundary pages shared by neighboring shards.
+    // Every local gradient producer must precede remote copies. Owners need only their own output
+    // prefetch, which the loop above already ordered.
     mergeStreams();
 
     reduceScatterGradients<ScalarType>(

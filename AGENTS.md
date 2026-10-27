@@ -151,6 +151,8 @@ C++ files:
   about placement. Prefetching an overlapping range onto multiple GPUs can cause
   migration contention.
 - Avoid quadratic cross-device event waits. Add synchronization only for a
-  concrete dependency; do not assume page-sharing hazards are proven absent.
+  concrete dependency. Disjoint ranges that share a managed-memory page are not
+  a hazard and need no cross-device ordering; do not assume hazards are absent
+  when ranges overlap.
 - Use consistent index types and existing helpers such as ceil_div. Avoid casts
   that are unnecessary given the operand and destination types.
