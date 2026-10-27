@@ -1342,15 +1342,11 @@ scatterAddLocalGradients(const int32_t *__restrict__ localToGlobal,
     }
 }
 
-// Owner-side staging for remote rows, sized for the owner's largest transfer.
-struct ReceiveBuffers {
-    torch::Tensor ids;
-    std::vector<torch::Tensor> gradients;
-};
-
-// Every source list contains unique sorted IDs. Sources are accumulated sequentially on the
-// owner's stream, so scatter-add needs no atomics. The caller orders all source producers and
-// each owner's output discard-prefetch before this function, and remote reads before source frees.
+// Every source list contains unique sorted IDs. Owners read each source's local rows in place
+// through peer access, so remote rows need no staging copies. Sources are accumulated
+// sequentially on the owner's stream, so scatter-add needs no atomics. The caller orders all
+// source producers and each owner's output discard-prefetch before this function, and remote
+// reads before source frees.
 template <typename ScalarType, bool IS_PACKED>
 void
 reduceScatterGradients(const std::vector<GradientShard> &shards,
@@ -1362,38 +1358,6 @@ reduceScatterGradients(const std::vector<GradientShard> &shards,
     std::vector<int64_t> numComponents;
     for (const auto &globalGradient: globalGradients) {
         numComponents.push_back(globalGradient.numel() / numGaussians);
-    }
-
-    // Shards and sources reuse each owner's receive buffers in its stream order, and the buffers
-    // are freed on that stream after the last scatter-add.
-    std::vector<int64_t> maxRemoteCount(c10::cuda::device_count(), 0);
-    for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
-        const auto ownerId = shards[shardIndex].ownerId;
-        for (const auto sourceId: c10::irange(c10::cuda::device_count())) {
-            if (sourceId != ownerId) {
-                const auto offsets      = shardOffsets[sourceId][shardIndex];
-                maxRemoteCount[ownerId] =
-                    std::max(maxRemoteCount[ownerId], int64_t{offsets[1]} - offsets[0]);
-            }
-        }
-    }
-    const auto idOptions = globalGradients.front().options().dtype(torch::kInt32);
-    std::vector<ReceiveBuffers> receiveBuffers(c10::cuda::device_count());
-    for (const auto ownerId: c10::irange(c10::cuda::device_count())) {
-        const int64_t maxCount = maxRemoteCount[ownerId];
-        if (maxCount) {
-            C10_CUDA_CHECK(cudaSetDevice(ownerId));
-            auto stream    = c10::cuda::getCurrentCUDAStream(ownerId);
-            auto &received = receiveBuffers[ownerId];
-            received.ids   = makeDeviceBuffer({maxCount}, idOptions, ownerId, stream);
-            for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
-                received.gradients.push_back(
-                    makeDeviceBuffer({maxCount, numComponents[tensorIndex]},
-                                     globalGradients[tensorIndex].options(),
-                                     ownerId,
-                                     stream));
-            }
-        }
     }
 
     for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
@@ -1424,46 +1388,21 @@ reduceScatterGradients(const std::vector<GradientShard> &shards,
             const int64_t begin = offsets[0];
             const int64_t count = offsets[1] - begin;
             if (count) {
-                const auto &source   = localGaussians[sourceId];
-                const bool isRemote  = sourceId != shard.ownerId;
-                const auto &received = receiveBuffers[shard.ownerId];
-                // Every tensor's rows share these IDs, so a remote source sends them once.
-                const auto *ids = source.localToGlobal.const_data_ptr<int32_t>() + begin;
-                if (isRemote) {
-                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(received.ids.data_ptr<int32_t>(),
-                                                       shard.ownerId,
-                                                       ids,
-                                                       sourceId,
-                                                       count * sizeof(int32_t),
-                                                       stream));
-                    ids = received.ids.const_data_ptr<int32_t>();
-                }
-                int64_t numValues = 0;
+                const auto &source = localGaussians[sourceId];
+                int64_t numValues  = 0;
                 for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
-                    const int64_t tensorValues = count * numComponents[tensorIndex];
-                    const auto *values =
+                    gradients.localGradients[tensorIndex] =
                         source.gradients[tensorIndex].const_data_ptr<ScalarType>() +
                         begin * numComponents[tensorIndex];
-                    if (isRemote) {
-                        auto *receivedValues =
-                            received.gradients[tensorIndex].data_ptr<ScalarType>();
-                        C10_CUDA_CHECK(cudaMemcpyPeerAsync(receivedValues,
-                                                           shard.ownerId,
-                                                           values,
-                                                           sourceId,
-                                                           tensorValues * sizeof(ScalarType),
-                                                           stream));
-                        values = receivedValues;
-                    }
-                    gradients.localGradients[tensorIndex] = values;
-                    numValues += tensorValues;
+                    numValues += count * numComponents[tensorIndex];
                     gradients.valuesEnd[tensorIndex] = numValues;
                 }
                 std::fill(gradients.valuesEnd + globalGradients.size(),
                           gradients.valuesEnd + LocalGaussians::END,
                           numValues);
                 scatterAddLocalGradients<ScalarType>
-                    <<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(ids, gradients);
+                    <<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
+                        source.localToGlobal.const_data_ptr<int32_t>() + begin, gradients);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
         }
@@ -2031,7 +1970,7 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    // Every local gradient producer must precede remote copies. Owners need only their own output
+    // Every local gradient producer must precede remote reads. Owners need only their own output
     // prefetch, which the loop above already ordered.
     mergeStreams();
 
