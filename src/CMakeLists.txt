@@ -50,7 +50,6 @@ set(FVDB_CPP_FILES
     fvdb/detail/io/GaussianPlyIO.cpp
     fvdb/detail/io/LoadNanovdb.cpp
     fvdb/detail/utils/cuda/LocalGradient.cpp
-    fvdb/detail/utils/cuda/Prefetch.cpp
     fvdb/detail/ops/jagged/JaggedReductions.cpp
     fvdb/detail/viewer/GaussianSplat3dView.cpp
     fvdb/detail/viewer/Viewer.cpp
