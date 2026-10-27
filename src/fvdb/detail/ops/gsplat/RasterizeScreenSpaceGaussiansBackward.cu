@@ -83,8 +83,8 @@ struct RasterizeBackwardArgs {
     VectorAccessor mOutDLossDFeatures;  // [C, N, NUM_CHANNELS] or [nnz, NUM_CHANNELS]
     ScalarAccessor mOutDLossDOpacities; // [C, N] or [nnz]
 
-    // Intersection lists retain original IDs. When present, this map converts them to the
-    // packed indices shared by the input tensors and local gradient outputs.
+    // Intersection lists retain global IDs. When present, this map converts them to the local
+    // packed indices shared by the input tensors and gradient outputs.
     const int32_t *mGlobalToLocal = nullptr;
 
     RasterizeBackwardArgs(
@@ -249,7 +249,7 @@ struct RasterizeBackwardArgs {
         return mDLossDRenderedFeatures[pixelIndex][channel];
     }
 
-    // g is a compact input ID when mGlobalToLocal is present, otherwise an original Gaussian ID.
+    // g is a local Gaussian ID when mGlobalToLocal is present, otherwise a global Gaussian ID.
     inline __device__ void
     fetchGaussianFeatureIntoSharedMemory(const int32_t g,
                                          const size_t channelStart,
@@ -664,7 +664,7 @@ struct RasterizeBackwardArgs {
         }
 
         // Load only the prefix that can contribute to an active pixel. The marking pass uses
-        // the same cutoff, so only Gaussians in this prefix have compact device-local entries.
+        // the same cutoff, so only Gaussians in this prefix have local entries.
         // Intersection offsets remain relative to the original tile list.
         const uint32_t tidx            = threadIdx.y * blockDim.x + threadIdx.x;
         const int64_t numIntersections = min(lastGaussianIdInBlock - firstGaussianIdInBlock,
@@ -716,7 +716,7 @@ struct RasterizeBackwardArgs {
                         commonArgs.mTileGaussianIds[idx]; // Gaussian index in [C * N] or [nnz]
                     const int32_t inputId = mGlobalToLocal != nullptr ? mGlobalToLocal[g] : g;
                     // getGaussian preserves inputId in Gaussian2D::id, so gradient atomics use
-                    // the same compact slot as attribute loads.
+                    // the same local slot as attribute loads.
                     sharedGaussians[tidx] = commonArgs.getGaussian(inputId);
                     // Only load features if the Gaussian could be valid for any pixel.
                     // If opacity < 1/255, alpha < 1/255 for all pixels regardless of
@@ -1159,12 +1159,12 @@ callRasterizeBackwardWithCorrectSharedChannels(
 }
 
 // Allocate device-local storage and free it on the same stream. Callers must order any remote
-// reads before destruction, as the final mergeStreams does for compact reduction buffers.
+// reads before destruction, as the final mergeStreams does for local gradients.
 torch::Tensor
-makeLocalBuffer(at::IntArrayRef sizes,
-                const torch::TensorOptions &options,
-                c10::DeviceIndex deviceId,
-                cudaStream_t stream) {
+makeDeviceBuffer(at::IntArrayRef sizes,
+                 const torch::TensorOptions &options,
+                 c10::DeviceIndex deviceId,
+                 cudaStream_t stream) {
     const c10::Device device(c10::kCUDA, deviceId);
 
     const size_t numBytes = at::detail::computeStorageNbytesContiguous(
@@ -1190,27 +1190,27 @@ makeLocalBuffer(at::IntArrayRef sizes,
 // Replace the source's Gaussian dimensions with the number requested on this device.
 template <bool IS_PACKED>
 torch::Tensor
-makeCompactBuffer(const torch::Tensor &source,
-                  int64_t numRequested,
-                  c10::DeviceIndex deviceId,
-                  cudaStream_t stream) {
+makeLocalGaussianBuffer(const torch::Tensor &source,
+                        int64_t numRequested,
+                        c10::DeviceIndex deviceId,
+                        cudaStream_t stream) {
     std::vector<int64_t> shape{numRequested};
     if (source.dim() == (IS_PACKED ? 2 : 3)) {
         shape.push_back(source.size(-1));
     }
-    return makeLocalBuffer(shape, source.options(), deviceId, stream);
+    return makeDeviceBuffer(shape, source.options(), deviceId, stream);
 }
 
 template <bool IS_PACKED>
 std::vector<torch::Tensor>
-makeCompactGradients(const std::vector<torch::Tensor> &outputs,
-                     int64_t numRequested,
-                     c10::DeviceIndex deviceId,
-                     cudaStream_t stream) {
+makeLocalGaussianGradients(const std::vector<torch::Tensor> &globalGradients,
+                           int64_t numRequested,
+                           c10::DeviceIndex deviceId,
+                           cudaStream_t stream) {
     std::vector<torch::Tensor> gradients;
-    gradients.reserve(outputs.size());
-    for (const auto &output: outputs) {
-        auto gradient = makeCompactBuffer<IS_PACKED>(output, numRequested, deviceId, stream);
+    gradients.reserve(globalGradients.size());
+    for (const auto &output: globalGradients) {
+        auto gradient = makeLocalGaussianBuffer<IS_PACKED>(output, numRequested, deviceId, stream);
         C10_CUDA_CHECK(cudaMemsetAsync(
             gradient.data_ptr(), 0, gradient.numel() * gradient.element_size(), stream));
         gradients.push_back(std::move(gradient));
@@ -1218,18 +1218,18 @@ makeCompactGradients(const std::vector<torch::Tensor> &outputs,
     return gradients;
 }
 
-// All per-device buffers use the same compact ordering. Only the original IDs and gradients
-// survive rasterization; reduction needs them to restore the original output indices.
-struct CompactGaussians {
+// All per-device buffers use the same local ordering. Only the global IDs and gradients
+// survive rasterization; reduction needs them to restore the global output indices.
+struct LocalGaussians {
     enum Gradient { MEANS2D, CONICS, FEATURES, OPACITIES, MEANS2D_ABS };
 
     torch::Tensor requestMask;            // [G + 1], including the scan sentinel
     torch::Tensor globalToLocal;          // [G + 1], exclusive prefix counts
-    torch::Tensor gaussianIds;            // [U], sorted original IDs
+    torch::Tensor localToGlobal;          // [U], sorted global IDs
     std::vector<torch::Tensor> gradients; // Indexed by Gradient, each [U] or [U, K]
 };
 
-// A contiguous part of one output tensor owned by one GPU.
+// A contiguous part of one global gradient owned by one GPU.
 struct GradientShard {
     size_t tensorIndex;
     c10::DeviceIndex ownerId;
@@ -1248,14 +1248,14 @@ struct GradientShard {
     }
 };
 
-// Preserve output placement: dense tensors are sharded by Gaussian within each camera; packed
-// tensors retain their flat element shards, which can split a Gaussian's component vector.
+// Preserve global gradient placement: dense gradients are sharded by Gaussian per camera; packed
+// gradients retain their flat element shards, which can split a Gaussian's component vector.
 template <bool IS_PACKED>
 std::vector<GradientShard>
-makeGradientShards(const std::vector<torch::Tensor> &outputs, int64_t numGaussians) {
+makeGradientShards(const std::vector<torch::Tensor> &globalGradients, int64_t numGaussians) {
     std::vector<GradientShard> shards;
-    for (size_t tensorIndex = 0; tensorIndex < outputs.size(); ++tensorIndex) {
-        const auto &output          = outputs[tensorIndex];
+    for (size_t tensorIndex = 0; tensorIndex < globalGradients.size(); ++tensorIndex) {
+        const auto &output          = globalGradients[tensorIndex];
         const int64_t numComponents = output.numel() / numGaussians;
         for (const auto ownerId: c10::irange(c10::cuda::device_count())) {
             if constexpr (IS_PACKED) {
@@ -1284,23 +1284,23 @@ makeGradientShards(const std::vector<torch::Tensor> &outputs, int64_t numGaussia
 
 template <typename ScalarType>
 __global__ void
-scatterAddCompactGradients(const int32_t *__restrict__ gaussianIds,
-                           const ScalarType *__restrict__ gradients,
-                           ScalarType *__restrict__ output,
-                           const int64_t numValues,
-                           const int64_t numComponents,
-                           const int64_t firstElement,
-                           const int64_t endElement) {
+scatterAddLocalGradients(const int32_t *__restrict__ localToGlobal,
+                         const ScalarType *__restrict__ localGradients,
+                         ScalarType *__restrict__ globalGradient,
+                         const int64_t numValues,
+                         const int64_t numComponents,
+                         const int64_t firstElement,
+                         const int64_t endElement) {
     const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
     if (index >= numValues) {
         return;
     }
     const int64_t outputIndex =
-        int64_t{gaussianIds[index / numComponents]} * numComponents + index % numComponents;
+        int64_t{localToGlobal[index / numComponents]} * numComponents + index % numComponents;
     // Packed output ownership can split a Gaussian across devices. Each owner writes only its
-    // own components, even though the transferred compact rows contain complete Gaussians.
+    // own components, even though the transferred local rows contain complete Gaussians.
     if (outputIndex >= firstElement && outputIndex < endElement) {
-        output[outputIndex] += gradients[index];
+        globalGradient[outputIndex] += localGradients[index];
     }
 }
 
@@ -1309,13 +1309,13 @@ scatterAddCompactGradients(const int32_t *__restrict__ gaussianIds,
 // output discard-prefetches before this function, and all remote reads before source frees.
 template <typename ScalarType>
 void
-reduceCompactGradients(const std::vector<GradientShard> &shards,
+reduceScatterGradients(const std::vector<GradientShard> &shards,
                        const torch::TensorAccessor<int32_t, 3> shardOffsets,
-                       const std::vector<CompactGaussians> &compactGaussians,
-                       const std::vector<torch::Tensor> &outputs) {
+                       const std::vector<LocalGaussians> &localGaussians,
+                       const std::vector<torch::Tensor> &globalGradients) {
     for (size_t shardIndex = 0; shardIndex < shards.size(); ++shardIndex) {
         const auto &shard  = shards[shardIndex];
-        const auto &output = outputs[shard.tensorIndex];
+        const auto &output = globalGradients[shard.tensorIndex];
         C10_CUDA_CHECK(cudaSetDevice(shard.ownerId));
         auto stream     = c10::cuda::getCurrentCUDAStream(shard.ownerId);
         auto *outputPtr = output.data_ptr<ScalarType>();
@@ -1332,9 +1332,9 @@ reduceCompactGradients(const std::vector<GradientShard> &shards,
         torch::Tensor receivedIds;
         torch::Tensor receivedGradients;
         if (maxRemoteCount > 0) {
-            receivedIds = makeLocalBuffer(
+            receivedIds = makeDeviceBuffer(
                 {maxRemoteCount}, output.options().dtype(torch::kInt32), shard.ownerId, stream);
-            receivedGradients = makeLocalBuffer(
+            receivedGradients = makeDeviceBuffer(
                 {maxRemoteCount, shard.numComponents}, output.options(), shard.ownerId, stream);
         }
 
@@ -1345,9 +1345,9 @@ reduceCompactGradients(const std::vector<GradientShard> &shards,
             if (count == 0) {
                 continue;
             }
-            const auto &source      = compactGaussians[sourceId];
+            const auto &source      = localGaussians[sourceId];
             const int64_t numValues = count * shard.numComponents;
-            const auto *ids         = source.gaussianIds.const_data_ptr<int32_t>() + begin;
+            const auto *ids         = source.localToGlobal.const_data_ptr<int32_t>() + begin;
             const auto *values = source.gradients[shard.tensorIndex].const_data_ptr<ScalarType>() +
                                  begin * shard.numComponents;
             if (sourceId != shard.ownerId) {
@@ -1366,7 +1366,7 @@ reduceCompactGradients(const std::vector<GradientShard> &shards,
                 ids    = receivedIds.const_data_ptr<int32_t>();
                 values = receivedGradients.const_data_ptr<ScalarType>();
             }
-            scatterAddCompactGradients<ScalarType><<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
+            scatterAddLocalGradients<ScalarType><<<GET_BLOCKS(numValues, 256), 256, 0, stream>>>(
                 ids,
                 values,
                 outputPtr,
@@ -1446,13 +1446,13 @@ gatherGaussianRequestMetadata(const int32_t *__restrict__ globalToLocal,
 // Scan bool flags as int32 counts, then read the count and all shard bounds in one D2H copy.
 // metadataIndices selects globalToLocal[G] and the scan values at each shard's boundaries.
 void
-scanGaussianRequests(CompactGaussians &compact,
+scanGaussianRequests(LocalGaussians &local,
                      const torch::Tensor &metadataIndices,
                      int32_t *hostMetadata,
                      cudaStream_t stream) {
-    const auto metadata = makeLocalBuffer(metadataIndices.sizes(),
-                                           compact.globalToLocal.options(),
-                                           compact.globalToLocal.get_device(),
+    const auto metadata        = makeDeviceBuffer(metadataIndices.sizes(),
+                                           local.globalToLocal.options(),
+                                           local.globalToLocal.get_device(),
                                            stream);
     const size_t metadataBytes = metadataIndices.numel() * sizeof(int32_t);
     C10_CUDA_CHECK(cudaMemcpyAsync(metadata.data_ptr<int32_t>(),
@@ -1461,10 +1461,10 @@ scanGaussianRequests(CompactGaussians &compact,
                                    cudaMemcpyHostToDevice,
                                    stream));
 
-    const int64_t numGaussians = compact.requestMask.numel() - 1;
-    auto *globalToLocal        = compact.globalToLocal.data_ptr<int32_t>();
-    const auto requestFlags = thrust::make_transform_iterator(compact.requestMask.data_ptr<bool>(),
-                                                              GaussianRequestFlag{});
+    const int64_t numGaussians = local.requestMask.numel() - 1;
+    auto *globalToLocal        = local.globalToLocal.data_ptr<int32_t>();
+    const auto requestFlags =
+        thrust::make_transform_iterator(local.requestMask.data_ptr<bool>(), GaussianRequestFlag{});
     FVDB_CUB_WRAPPER_ASYNC(
         stream, cub::DeviceScan::ExclusiveSum, requestFlags, globalToLocal, numGaussians + 1);
     gatherGaussianRequestMetadata<<<GET_BLOCKS(metadata.numel(), 256), 256, 0, stream>>>(
@@ -1477,16 +1477,16 @@ scanGaussianRequests(CompactGaussians &compact,
                                    stream));
 }
 
-// The exclusive scan assigns compact IDs in ascending original-ID order. Only marked entries
-// in globalToLocal are used; unmarked entries have no corresponding compact Gaussian.
+// The exclusive scan assigns local IDs in ascending global-ID order. Only marked entries of
+// globalToLocal are local IDs, so only they are inverted.
 __global__ void
-buildCompactGaussianIds(const bool *__restrict__ requestMask,
-                        const int32_t *__restrict__ globalToLocal,
-                        int32_t *__restrict__ gaussianIds,
-                        const int64_t numGaussians) {
+invertGlobalToLocal(const bool *__restrict__ requestMask,
+                    const int32_t *__restrict__ globalToLocal,
+                    int32_t *__restrict__ localToGlobal,
+                    const int64_t numGaussians) {
     const int64_t g = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
     if (g < numGaussians && requestMask[g]) {
-        gaussianIds[globalToLocal[g]] = static_cast<int32_t>(g);
+        localToGlobal[globalToLocal[g]] = static_cast<int32_t>(g);
     }
 }
 
@@ -1499,17 +1499,17 @@ struct GaussianInputLayout {
 
 template <typename ScalarType, bool IS_PACKED>
 __global__ void
-gatherCompactGaussianInputKernel(const ScalarType *__restrict__ source,
-                                 ScalarType *__restrict__ destination,
-                                 const int32_t *__restrict__ gaussianIds,
-                                 const GaussianInputLayout layout,
-                                 const int64_t numComponents,
-                                 const int64_t numElements) {
+gatherLocalGaussianInputKernel(const ScalarType *__restrict__ source,
+                               ScalarType *__restrict__ destination,
+                               const int32_t *__restrict__ localToGlobal,
+                               const GaussianInputLayout layout,
+                               const int64_t numComponents,
+                               const int64_t numElements) {
     const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
     if (index >= numElements) {
         return;
     }
-    const int64_t g         = gaussianIds[index / numComponents];
+    const int64_t g         = localToGlobal[index / numComponents];
     const int64_t component = index % numComponents;
     int64_t sourceOffset;
     if constexpr (IS_PACKED) {
@@ -1521,16 +1521,16 @@ gatherCompactGaussianInputKernel(const ScalarType *__restrict__ source,
     destination[index] = source[sourceOffset + component * layout.componentStride];
 }
 
-// Visit only selected Gaussians, in original-ID order. Respect source strides while writing
-// contiguous compact storage, including broadcast or permuted source views.
+// Visit only selected Gaussians, in global-ID order. Respect source strides while writing
+// contiguous local storage, including broadcast or permuted source views.
 template <typename ScalarType, bool IS_PACKED>
 torch::Tensor
-gatherCompactGaussianInput(const torch::Tensor &source,
-                           const torch::Tensor &gaussianIds,
-                           c10::DeviceIndex deviceId,
-                           cudaStream_t stream) {
+gatherLocalGaussianInput(const torch::Tensor &source,
+                         const torch::Tensor &localToGlobal,
+                         c10::DeviceIndex deviceId,
+                         cudaStream_t stream) {
     torch::Tensor destination =
-        makeCompactBuffer<IS_PACKED>(source, gaussianIds.numel(), deviceId, stream);
+        makeLocalGaussianBuffer<IS_PACKED>(source, localToGlobal.numel(), deviceId, stream);
     if (destination.numel() == 0) {
         return destination;
     }
@@ -1541,11 +1541,11 @@ gatherCompactGaussianInput(const torch::Tensor &source,
         IS_PACKED ? 0 : source.stride(0),
         source.stride(NUM_OUTER_DIMS - 1),
         source.dim() == NUM_OUTER_DIMS ? 0 : source.stride(NUM_OUTER_DIMS)};
-    gatherCompactGaussianInputKernel<ScalarType, IS_PACKED>
+    gatherLocalGaussianInputKernel<ScalarType, IS_PACKED>
         <<<GET_BLOCKS(destination.numel(), 256), 256, 0, stream>>>(
             source.const_data_ptr<ScalarType>(),
             destination.data_ptr<ScalarType>(),
-            gaussianIds.const_data_ptr<int32_t>(),
+            localToGlobal.const_data_ptr<int32_t>(),
             layout,
             numComponents,
             destination.numel());
@@ -1553,6 +1553,10 @@ gatherCompactGaussianInput(const torch::Tensor &source,
     return destination;
 }
 
+// Each GPU gathers local copies of the Gaussians its tiles request. Each GPU then runs the same
+// backward rasterization kernel on its local Gaussians, accumulating local gradients. The local
+// gradients from every GPU are reduce-scattered into the global gradients, with each GPU reducing
+// the shard it owns.
 template <typename ScalarType, size_t NUM_CHANNELS, size_t NUM_SHARED_CHANNELS, bool IS_PACKED>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 callRasterizeBackwardPrivateUse1(
@@ -1597,7 +1601,7 @@ callRasterizeBackwardPrivateUse1(
     const auto reshapedDLossDRenderedAlphas =
         activeTiles.has_value() ? dLossDRenderedAlphas : dLossDRenderedAlphas.view({-1, 1});
 
-    // Compact gradients are scattered into the original output layout after owner-directed
+    // Local gradients are scattered into the global gradient layout after owner-directed
     // transfers. Dense Gaussian ownership and packed flat-element ownership stay unchanged.
     torch::Tensor outDLossDMeans2d   = torch::empty(means2d.sizes(), means2d.options());
     torch::Tensor outDLossDConics    = torch::empty(conics.sizes(), conics.options());
@@ -1622,17 +1626,17 @@ callRasterizeBackwardPrivateUse1(
     const int64_t tileAlignment = activeTiles.has_value() || tileCount == 0 ? 1 : tileExtentW;
     std::vector<torch::Tensor> tileTensors = {dLossDRenderedFeatures, dLossDRenderedAlphas};
 
-    // Keep output tensors and compact gradient slots in CompactGaussians::Gradient order.
-    std::vector<torch::Tensor> outTensors = {
+    // Keep global and local gradient slots in LocalGaussians::Gradient order.
+    std::vector<torch::Tensor> globalGradients = {
         outDLossDMeans2d, outDLossDConics, outDLossDFeatures, outDLossDOpacities};
     if (absGrad) {
-        outTensors.emplace_back(outDLossDMeans2dAbs);
+        globalGradients.emplace_back(outDLossDMeans2dAbs);
     }
 
     std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
     // Keep each device's current compute stream unchanged through allocation, rasterization,
     // reduction, and release: the owning tensors enqueue their frees on their allocation streams.
-    std::vector<CompactGaussians> compactGaussians(c10::cuda::device_count());
+    std::vector<LocalGaussians> localGaussians(c10::cuda::device_count());
 
     // Prefetch inputs after prior work, then make the current streams wait for those inputs.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
@@ -1670,9 +1674,9 @@ callRasterizeBackwardPrivateUse1(
 
     const int64_t numGaussians = opacities.numel();
     TORCH_CHECK_VALUE(numGaussians > 0 && numGaussians <= std::numeric_limits<int32_t>::max(),
-                      "Compact Gaussians require a positive Gaussian count that fits in int32");
+                      "Local Gaussians require a positive Gaussian count that fits in int32");
     const std::vector<GradientShard> gradientShards =
-        makeGradientShards<IS_PACKED>(outTensors, numGaussians);
+        makeGradientShards<IS_PACKED>(globalGradients, numGaussians);
     const int64_t numGradientShards = gradientShards.size();
     const int64_t numMetadataValues = 1 + 2 * numGradientShards;
     const auto metadataOptions =
@@ -1735,12 +1739,12 @@ callRasterizeBackwardPrivateUse1(
             tilePixelMask,
             tilePixelCumsum,
             pixelMap);
-        auto &compact       = compactGaussians[deviceId];
-        compact.requestMask = makeLocalBuffer(
+        auto &local       = localGaussians[deviceId];
+        local.requestMask = makeDeviceBuffer(
             {numGaussians + 1}, opacities.options().dtype(torch::kBool), deviceId, stream);
-        compact.globalToLocal = makeLocalBuffer(
+        local.globalToLocal = makeDeviceBuffer(
             {numGaussians + 1}, opacities.options().dtype(torch::kInt32), deviceId, stream);
-        auto *requestMask = compact.requestMask.data_ptr<bool>();
+        auto *requestMask = local.requestMask.data_ptr<bool>();
         C10_CUDA_CHECK(cudaMemsetAsync(requestMask, 0, (numGaussians + 1) * sizeof(bool), stream));
 
         const dim3 blockDim = {tileSize, tileSize, 1};
@@ -1749,8 +1753,7 @@ callRasterizeBackwardPrivateUse1(
             <<<gridDim, blockDim, 0, stream>>>(args.commonArgs, args.mLastGaussianIds, requestMask);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        scanGaussianRequests(
-            compact, metadataIndices, requestMetadata[deviceId].data(), stream);
+        scanGaussianRequests(local, metadataIndices, requestMetadata[deviceId].data(), stream);
     }
 
     // Submit every output prefetch before the count readback can block the host launch thread.
@@ -1764,8 +1767,8 @@ callRasterizeBackwardPrivateUse1(
         std::vector<size_t> prefetchSizes;
         for (const auto &shard: gradientShards) {
             if (shard.ownerId == deviceId) {
-                prefetchPointers.emplace_back(outTensors[shard.tensorIndex].data_ptr<ScalarType>() +
-                                              shard.firstElement);
+                prefetchPointers.emplace_back(
+                    globalGradients[shard.tensorIndex].data_ptr<ScalarType>() + shard.firstElement);
                 prefetchSizes.emplace_back(shard.numElements * sizeof(ScalarType));
             }
         }
@@ -1789,47 +1792,47 @@ callRasterizeBackwardPrivateUse1(
         if (deviceTileCount == 0) {
             continue;
         }
-        auto &compact = compactGaussians[deviceId];
+        auto &local = localGaussians[deviceId];
         C10_CUDA_CHECK(cudaStreamSynchronize(stream));
         const int64_t numRequested = requestMetadata[deviceId][0];
         if (numRequested == 0) {
-            compact.requestMask   = torch::Tensor();
-            compact.globalToLocal = torch::Tensor();
+            local.requestMask   = torch::Tensor();
+            local.globalToLocal = torch::Tensor();
             continue;
         }
 
         // Build the inverse map for gathering inputs and scattering gradients to their owners.
-        compact.gaussianIds = makeLocalBuffer(
+        local.localToGlobal = makeDeviceBuffer(
             {numRequested}, opacities.options().dtype(torch::kInt32), deviceId, stream);
-        const auto *globalToLocal = compact.globalToLocal.const_data_ptr<int32_t>();
-        buildCompactGaussianIds<<<GET_BLOCKS(numGaussians, 256), 256, 0, stream>>>(
-            compact.requestMask.const_data_ptr<bool>(),
+        const auto *globalToLocal = local.globalToLocal.const_data_ptr<int32_t>();
+        invertGlobalToLocal<<<GET_BLOCKS(numGaussians, 256), 256, 0, stream>>>(
+            local.requestMask.const_data_ptr<bool>(),
             globalToLocal,
-            compact.gaussianIds.data_ptr<int32_t>(),
+            local.localToGlobal.data_ptr<int32_t>(),
             numGaussians);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        compact.requestMask = torch::Tensor();
+        local.requestMask = torch::Tensor();
 
-        const auto means2dLocal = gatherCompactGaussianInput<ScalarType, IS_PACKED>(
-            means2d, compact.gaussianIds, deviceId, stream);
-        const auto conicsLocal = gatherCompactGaussianInput<ScalarType, IS_PACKED>(
-            conics, compact.gaussianIds, deviceId, stream);
-        const auto opacitiesLocal = gatherCompactGaussianInput<ScalarType, IS_PACKED>(
-            opacities, compact.gaussianIds, deviceId, stream);
-        const auto featuresLocal = gatherCompactGaussianInput<ScalarType, IS_PACKED>(
-            features, compact.gaussianIds, deviceId, stream);
-        compact.gradients =
-            makeCompactGradients<IS_PACKED>(outTensors, numRequested, deviceId, stream);
+        const auto localMeans2d = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+            means2d, local.localToGlobal, deviceId, stream);
+        const auto localConics = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+            conics, local.localToGlobal, deviceId, stream);
+        const auto localOpacities = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+            opacities, local.localToGlobal, deviceId, stream);
+        const auto localFeatures = gatherLocalGaussianInput<ScalarType, IS_PACKED>(
+            features, local.localToGlobal, deviceId, stream);
+        local.gradients =
+            makeLocalGaussianGradients<IS_PACKED>(globalGradients, numRequested, deviceId, stream);
 
-        // Compact input and gradient tensors share the existing packed layout. The original
+        // Local input and gradient tensors share the existing packed layout. The global
         // source layout is needed only for gathering attributes and assigning output owners.
         // Backgrounds and masks were validated before request marking. Attach them below;
         // packed sparse inputs have no camera count for repeating their shape checks.
         RasterizeBackwardArgs<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true> args(
-            means2dLocal,
-            conicsLocal,
-            opacitiesLocal,
-            featuresLocal,
+            localMeans2d,
+            localConics,
+            localOpacities,
+            localFeatures,
             std::nullopt,
             std::nullopt,
             renderWindow,
@@ -1841,11 +1844,11 @@ callRasterizeBackwardPrivateUse1(
             reshapedLastGaussianIds,
             reshapedDLossDRenderedFeatures,
             reshapedDLossDRenderedAlphas,
-            compact.gradients[CompactGaussians::MEANS2D],
-            compact.gradients[CompactGaussians::CONICS],
-            compact.gradients[CompactGaussians::FEATURES],
-            compact.gradients[CompactGaussians::OPACITIES],
-            absGrad ? std::make_optional(compact.gradients[CompactGaussians::MEANS2D_ABS])
+            local.gradients[LocalGaussians::MEANS2D],
+            local.gradients[LocalGaussians::CONICS],
+            local.gradients[LocalGaussians::FEATURES],
+            local.gradients[LocalGaussians::OPACITIES],
+            absGrad ? std::make_optional(local.gradients[LocalGaussians::MEANS2D_ABS])
                     : std::nullopt,
             activeTiles,
             tilePixelMask,
@@ -1878,12 +1881,12 @@ callRasterizeBackwardPrivateUse1(
         const dim3 blockDim = {tileSize, tileSize, 1};
         const dim3 gridDim  = {deviceTileCount, 1, 1};
 
-        // Marking, compaction, copying, rasterization, and frees use the same stream.
-        // The tile cutoff ensures every loaded original ID has a populated compact slot.
+        // Marking, inversion, gathering, rasterization, and frees use the same stream.
+        // The tile cutoff ensures every loaded global ID has a populated local slot.
         rasterizeGaussiansBackward<ScalarType, NUM_CHANNELS, NUM_SHARED_CHANNELS, true>
             <<<gridDim, blockDim, sharedMemSize, stream>>>(args);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        compact.globalToLocal = torch::Tensor();
+        local.globalToLocal = torch::Tensor();
     }
 
     // Scatter-add reductions wait for output prefetching after rasterization has been submitted.
@@ -1894,16 +1897,17 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    // Every compact gradient producer must precede remote copies. Finish every discard-prefetch
+    // Every local gradient producer must precede remote copies. Finish every discard-prefetch
     // before writing managed outputs, including boundary pages shared by neighboring shards.
     mergeStreams();
 
-    reduceCompactGradients<ScalarType>(gradientShards, shardOffsets, compactGaussians, outTensors);
+    reduceScatterGradients<ScalarType>(
+        gradientShards, shardOffsets, localGaussians, globalGradients);
 
     // Remote reads run on destination streams. Order each source stream after those reads
     // before its tensors enqueue frees, and expose completed output writes to every device.
     mergeStreams();
-    compactGaussians.clear();
+    localGaussians.clear();
 
     return std::make_tuple(outDLossDMeans2dAbs,
                            outDLossDMeans2d,
