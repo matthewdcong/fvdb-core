@@ -16,7 +16,6 @@ namespace detail {
 /// ordered on the non-default input stream. On CUDA 13+, discard existing contents to avoid
 /// migrating data that will be overwritten; callers must overwrite discarded data before reading
 /// it. On older CUDA versions, fall back to individual prefetch calls without discarding contents.
-/// Queue a bounded GPU delay before each prefetch call to reduce host submission stalls.
 void memDiscardAndPrefetchBatchAsync(std::vector<void *> &prefetchPointers,
                                      std::vector<size_t> &prefetchSizes,
                                      int deviceId,

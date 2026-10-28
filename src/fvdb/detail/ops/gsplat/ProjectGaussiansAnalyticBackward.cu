@@ -31,9 +31,10 @@ namespace {
 
 namespace cg = cooperative_groups;
 
+// Gaussian gradients use local indices; inputs and gradient state use global indices.
 template <typename T, typename Camera>
 __global__ __launch_bounds__(DEFAULT_BLOCK_DIM) void
-projectionBackwardKernel(const int32_t offset,
+projectionBackwardKernel(const int64_t offset,
                          const int32_t count,
                          // fwd inputs
                          const uint32_t C,
@@ -76,6 +77,7 @@ projectionBackwardKernel(const int32_t offset,
     if (gId >= count) {
         return;
     }
+    const uint32_t outputIdx = gId;
     gId += offset;
     auto idx = cId * N + gId;
     // Per-axis visibility — culled gaussians have (0, 0); we also short-circuit
@@ -132,7 +134,7 @@ projectionBackwardKernel(const int32_t offset,
             dLossDDepths ? dLossDDepths[idx] : T{0});
 
     if (outDLossDMeans != nullptr) {
-        outDLossDMeans += gId * 3;
+        outDLossDMeans += outputIdx * 3;
 #pragma unroll
         for (uint32_t i = 0; i < 3; i++) {
             gpuAtomicAdd(outDLossDMeans + i, dLossDPoint[i]);
@@ -140,7 +142,7 @@ projectionBackwardKernel(const int32_t offset,
     }
     if (outDLossDCovars != nullptr) {
         // Output gradients w.r.t. the covariance matrix
-        outDLossDCovars += gId * 6;
+        outDLossDCovars += outputIdx * 6;
         gpuAtomicAdd(outDLossDCovars, dLossDCovar[0][0]);
         gpuAtomicAdd(outDLossDCovars + 1, dLossDCovar[0][1] + dLossDCovar[1][0]);
         gpuAtomicAdd(outDLossDCovars + 2, dLossDCovar[0][2] + dLossDCovar[2][0]);
@@ -157,8 +159,8 @@ projectionBackwardKernel(const int32_t offset,
             quaternionAndScaleToCovarianceVectorJacobianProduct<T, true>(
                 quat, scale, rotmat, dLossDCovar);
 
-        outDLossDQuats += gId * 4;
-        outDLossDScales += gId * 3;
+        outDLossDQuats += outputIdx * 4;
+        outDLossDScales += outputIdx * 3;
         gpuAtomicAdd(outDLossDQuats, dLossDQuat[0]);
         gpuAtomicAdd(outDLossDQuats + 1, dLossDQuat[1]);
         gpuAtomicAdd(outDLossDQuats + 2, dLossDQuat[2]);
@@ -452,78 +454,25 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
     }
     if (C && N) {
         std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
+        std::vector<torch::Tensor> dLossDMeansLocals(c10::cuda::device_count());
+        std::vector<torch::Tensor> dLossDCovarsLocals(c10::cuda::device_count());
+        std::vector<torch::Tensor> dLossDQuatsLocals(c10::cuda::device_count());
+        std::vector<torch::Tensor> dLossDScalesLocals(c10::cuda::device_count());
         std::vector<torch::Tensor> dLossDWorldToCamMatricesLocals(c10::cuda::device_count());
 
-        // Prepare gradients after prior work, then make the current streams wait for preparation.
+        // Preparation waits for prior work, but not for the local-gradient kernels below.
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
             prefetchStreams[deviceId] = c10::cuda::getStreamFromPool(false, deviceId);
-            auto prefetchStream       = prefetchStreams[deviceId];
-
-            cudaEvent_t prefetchEvent;
-            C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
-            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
-            C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStream, prefetchEvent));
-
-            int64_t elementOffset, elementCount;
-            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
-
-            if (elementCount > 0) {
-                std::vector<void *> prefetchPtrs;
-                std::vector<size_t> prefetchSizes;
-
-                prefetchPtrs.emplace_back(dLossDMeans.data_ptr<float>() +
-                                          elementOffset * dLossDMeans.stride(0));
-                prefetchSizes.emplace_back(elementCount * dLossDMeans.stride(0) * sizeof(float));
-                if (covars.has_value()) {
-                    prefetchPtrs.emplace_back(dLossDCovars.data_ptr<float>() +
-                                              elementOffset * dLossDCovars.stride(0));
-                    prefetchSizes.emplace_back(elementCount * dLossDCovars.stride(0) *
-                                               sizeof(float));
-                } else {
-                    prefetchPtrs.emplace_back(dLossDQuats.data_ptr<float>() +
-                                              elementOffset * dLossDQuats.stride(0));
-                    prefetchSizes.emplace_back(elementCount * dLossDQuats.stride(0) *
-                                               sizeof(float));
-                    prefetchPtrs.emplace_back(dLossDScales.data_ptr<float>() +
-                                              elementOffset * dLossDScales.stride(0));
-                    prefetchSizes.emplace_back(elementCount * dLossDScales.stride(0) *
-                                               sizeof(float));
-                }
-
-                memDiscardAndPrefetchBatchAsync(
-                    prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
-                C10_CUDA_CHECK(cudaMemsetAsync(dLossDMeans.data_ptr<float>() +
-                                                   elementOffset * dLossDMeans.stride(0),
-                                               0,
-                                               elementCount * dLossDMeans.stride(0) * sizeof(float),
-                                               prefetchStream));
-                if (covars.has_value()) {
-                    C10_CUDA_CHECK(cudaMemsetAsync(
-                        dLossDCovars.data_ptr<float>() + elementOffset * dLossDCovars.stride(0),
-                        0,
-                        elementCount * dLossDCovars.stride(0) * sizeof(float),
-                        prefetchStream));
-                } else {
-                    C10_CUDA_CHECK(cudaMemsetAsync(
-                        dLossDQuats.data_ptr<float>() + elementOffset * dLossDQuats.stride(0),
-                        0,
-                        elementCount * dLossDQuats.stride(0) * sizeof(float),
-                        prefetchStream));
-                    C10_CUDA_CHECK(cudaMemsetAsync(
-                        dLossDScales.data_ptr<float>() + elementOffset * dLossDScales.stride(0),
-                        0,
-                        elementCount * dLossDScales.stride(0) * sizeof(float),
-                        prefetchStream));
-                }
-            }
-            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
-            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
-            C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
+            cudaEvent_t event;
+            C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            C10_CUDA_CHECK(cudaEventRecord(event, stream));
+            C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], event));
+            C10_CUDA_CHECK(cudaEventDestroy(event));
         }
 
-        // Launch kernels on every device before submitting camera-gradient output prefetches.
+        // Launch kernels on every device before submitting managed-output prefetches.
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
@@ -537,6 +486,25 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
             }
 
             if (deviceProblemSize > 0) {
+                dLossDMeansLocals[deviceId] =
+                    makeLocalGradient(dLossDMeans.narrow(0, deviceProblemOffset, deviceProblemSize),
+                                      deviceId,
+                                      stream);
+                if (covars.has_value()) {
+                    dLossDCovarsLocals[deviceId] = makeLocalGradient(
+                        dLossDCovars.narrow(0, deviceProblemOffset, deviceProblemSize),
+                        deviceId,
+                        stream);
+                } else {
+                    dLossDQuatsLocals[deviceId] = makeLocalGradient(
+                        dLossDQuats.narrow(0, deviceProblemOffset, deviceProblemSize),
+                        deviceId,
+                        stream);
+                    dLossDScalesLocals[deviceId] = makeLocalGradient(
+                        dLossDScales.narrow(0, deviceProblemOffset, deviceProblemSize),
+                        deviceId,
+                        stream);
+                }
                 const dim3 NUM_BLOCKS(GET_BLOCKS(deviceProblemSize, DEFAULT_BLOCK_DIM), C);
 
                 if (ortho) {
@@ -569,10 +537,13 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
                             dLossDCompensations.has_value()
                                 ? dLossDCompensations.value().data_ptr<float>()
                                 : nullptr,
-                            dLossDMeans.data_ptr<float>(),
-                            covars.has_value() ? dLossDCovars.data_ptr<float>() : nullptr,
-                            covars.has_value() ? nullptr : dLossDQuats.data_ptr<float>(),
-                            covars.has_value() ? nullptr : dLossDScales.data_ptr<float>(),
+                            dLossDMeansLocals[deviceId].data_ptr<float>(),
+                            covars.has_value() ? dLossDCovarsLocals[deviceId].data_ptr<float>()
+                                               : nullptr,
+                            covars.has_value() ? nullptr
+                                               : dLossDQuatsLocals[deviceId].data_ptr<float>(),
+                            covars.has_value() ? nullptr
+                                               : dLossDScalesLocals[deviceId].data_ptr<float>(),
                             worldToCamMatricesRequiresGrad
                                 ? dLossDWorldToCamMatricesLocals[deviceId].data_ptr<float>()
                                 : nullptr,
@@ -617,10 +588,13 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
                             dLossDCompensations.has_value()
                                 ? dLossDCompensations.value().data_ptr<float>()
                                 : nullptr,
-                            dLossDMeans.data_ptr<float>(),
-                            covars.has_value() ? dLossDCovars.data_ptr<float>() : nullptr,
-                            covars.has_value() ? nullptr : dLossDQuats.data_ptr<float>(),
-                            covars.has_value() ? nullptr : dLossDScales.data_ptr<float>(),
+                            dLossDMeansLocals[deviceId].data_ptr<float>(),
+                            covars.has_value() ? dLossDCovarsLocals[deviceId].data_ptr<float>()
+                                               : nullptr,
+                            covars.has_value() ? nullptr
+                                               : dLossDQuatsLocals[deviceId].data_ptr<float>(),
+                            covars.has_value() ? nullptr
+                                               : dLossDScalesLocals[deviceId].data_ptr<float>(),
                             worldToCamMatricesRequiresGrad
                                 ? dLossDWorldToCamMatricesLocals[deviceId].data_ptr<float>()
                                 : nullptr,
@@ -640,48 +614,96 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
             }
         }
 
-        if (worldToCamMatricesRequiresGrad) {
-            // Kernels write camera gradients to device-local buffers, allowing output prefetching
-            // to overlap. Reuse the preparation streams to preserve their waits and ordering.
-            std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count(), nullptr);
-            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-                const auto [elementOffset, elementCount] =
+        // Only whole Gaussian shards are copied back; their gradients need no reduction.
+        // Managed-output preparation can overlap projection and the camera-gradient reduction.
+        std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+            C10_CUDA_CHECK(cudaSetDevice(deviceId));
+            int64_t elementOffset, elementCount;
+            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
+            std::vector<void *> prefetchPointers;
+            std::vector<size_t> prefetchSizes;
+            if (elementCount > 0) {
+                for (const auto &output: {dLossDMeans, dLossDCovars, dLossDQuats, dLossDScales}) {
+                    if (output.defined()) {
+                        prefetchPointers.emplace_back(output.data_ptr<float>() +
+                                                      elementOffset * output.stride(0));
+                        prefetchSizes.emplace_back(elementCount * output.stride(0) * sizeof(float));
+                    }
+                }
+            }
+            if (worldToCamMatricesRequiresGrad) {
+                int64_t cameraOffset, cameraCount;
+                std::tie(cameraOffset, cameraCount) =
                     deviceChunk(dLossDWorldToCamMatrices.numel(), deviceId);
-                if (elementCount == 0) {
-                    continue;
-                }
-
-                C10_CUDA_CHECK(cudaSetDevice(deviceId));
-                auto prefetchStream                  = prefetchStreams[deviceId];
-                std::vector<void *> prefetchPointers = {dLossDWorldToCamMatrices.data_ptr<float>() +
-                                                        elementOffset};
-                std::vector<size_t> prefetchSizes    = {elementCount * sizeof(float)};
-                memDiscardAndPrefetchBatchAsync(
-                    prefetchPointers, prefetchSizes, deviceId, prefetchStream);
-
-                // The output copy waits on these events after the reduction has been queued.
-                C10_CUDA_CHECK(cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId],
-                                                        cudaEventDisableTiming));
-                C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
-            }
-
-            reduceGradientShards(dLossDWorldToCamMatricesLocals);
-            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-                if (outputPrefetchEvents[deviceId]) {
-                    C10_CUDA_CHECK(cudaSetDevice(deviceId));
-                    auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-                    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[deviceId]));
-                    C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
+                if (cameraCount > 0) {
+                    prefetchPointers.emplace_back(dLossDWorldToCamMatrices.data_ptr<float>() +
+                                                  cameraOffset);
+                    prefetchSizes.emplace_back(cameraCount * sizeof(float));
                 }
             }
-            copyGradientShards<float>(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
-
-            // Enqueue frees after reduction and output copies, before merging the compute streams.
-            dLossDWorldToCamMatricesLocals.clear();
+            memDiscardAndPrefetchBatchAsync(
+                prefetchPointers, prefetchSizes, deviceId, prefetchStreams[deviceId]);
+            C10_CUDA_CHECK(
+                cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId], cudaEventDisableTiming));
+            C10_CUDA_CHECK(
+                cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStreams[deviceId]));
         }
 
+        if (worldToCamMatricesRequiresGrad) {
+            reduceGradientShards(dLossDWorldToCamMatricesLocals);
+        }
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+            C10_CUDA_CHECK(cudaSetDevice(deviceId));
+            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[deviceId]));
+            C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
+            int64_t elementOffset, elementCount;
+            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
+            if (elementCount == 0) {
+                continue;
+            }
+            C10_CUDA_CHECK(cudaMemcpyAsync(dLossDMeans.data_ptr<float>() +
+                                               elementOffset * dLossDMeans.stride(0),
+                                           dLossDMeansLocals[deviceId].data_ptr<float>(),
+                                           dLossDMeansLocals[deviceId].numel() * sizeof(float),
+                                           cudaMemcpyDeviceToDevice,
+                                           stream));
+            if (covars.has_value()) {
+                C10_CUDA_CHECK(cudaMemcpyAsync(dLossDCovars.data_ptr<float>() +
+                                                   elementOffset * dLossDCovars.stride(0),
+                                               dLossDCovarsLocals[deviceId].data_ptr<float>(),
+                                               dLossDCovarsLocals[deviceId].numel() * sizeof(float),
+                                               cudaMemcpyDeviceToDevice,
+                                               stream));
+            } else {
+                C10_CUDA_CHECK(cudaMemcpyAsync(dLossDQuats.data_ptr<float>() +
+                                                   elementOffset * dLossDQuats.stride(0),
+                                               dLossDQuatsLocals[deviceId].data_ptr<float>(),
+                                               dLossDQuatsLocals[deviceId].numel() * sizeof(float),
+                                               cudaMemcpyDeviceToDevice,
+                                               stream));
+                C10_CUDA_CHECK(cudaMemcpyAsync(dLossDScales.data_ptr<float>() +
+                                                   elementOffset * dLossDScales.stride(0),
+                                               dLossDScalesLocals[deviceId].data_ptr<float>(),
+                                               dLossDScalesLocals[deviceId].numel() * sizeof(float),
+                                               cudaMemcpyDeviceToDevice,
+                                               stream));
+            }
+        }
+        if (worldToCamMatricesRequiresGrad) {
+            copyGradientShards<float>(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
+        }
+
+        // Free local buffers on their compute streams after publication, before merging streams.
+        dLossDMeansLocals.clear();
+        dLossDCovarsLocals.clear();
+        dLossDQuatsLocals.clear();
+        dLossDScalesLocals.clear();
+        dLossDWorldToCamMatricesLocals.clear();
         mergeStreams();
     }
+
     return std::make_tuple(
         dLossDMeans, dLossDCovars, dLossDQuats, dLossDScales, dLossDWorldToCamMatrices);
 }

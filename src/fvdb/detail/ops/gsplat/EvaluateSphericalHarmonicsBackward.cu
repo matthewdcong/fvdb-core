@@ -350,6 +350,7 @@ evalShFunctionVJP(const int64_t degree,            // degree of SH to be evaluat
     }
 }
 
+// SH coefficients and output rows are local to the shard.
 template <typename T>
 __global__ __launch_bounds__(DEFAULT_BLOCK_DIM) void
 computeShBackward(
@@ -359,14 +360,15 @@ computeShBackward(
     const int64_t K,
     const int64_t D,
     const int64_t shDegreeToUse,
-    const T *__restrict__ means,                                                   // [N, 3]
-    const T *__restrict__ worldToCamMatrices,                                      // [C, 4, 4]
-    const int32_t *__restrict__ cameraIds,                                         // [N] optional
-    const int32_t *__restrict__ gaussianIds,                                       // [N] optional
-    const torch::PackedTensorAccessor64<T, 3, torch::RestrictPtrTraits> shNCoeffs, // [K-1, N, D]
-    const int *__restrict__ radii,                                                 // [C, N, 2]
+    const T *__restrict__ means,              // [N, 3]
+    const T *__restrict__ worldToCamMatrices, // [C, 4, 4]
+    const int32_t *__restrict__ cameraIds,    // [N] optional
+    const int32_t *__restrict__ gaussianIds,  // [N] optional
     const torch::PackedTensorAccessor64<T, 3, torch::RestrictPtrTraits>
-        dLossDRenderQuantities,                                                    // [C, N, D]
+        shNCoeffs,                            // [count, K-1, D]
+    const int *__restrict__ radii,            // [C, N, 2]
+    const torch::PackedTensorAccessor64<T, 3, torch::RestrictPtrTraits>
+        dLossDRenderQuantities,               // [C, N, D]
     torch::PackedTensorAccessor64<T, 3, torch::RestrictPtrTraits> outDLossDSh0Coeffs, // [N, 1, D]
     torch::PackedTensorAccessor64<T, 3, torch::RestrictPtrTraits> outDLossDShNCoeffs, // [N, K-1, D]
     T *__restrict__ outDLossDMeans,           // [N, 3] optional
@@ -404,7 +406,7 @@ computeShBackward(
                                             ? nullptr
                                             : &dLossDViewDir;
         evalShFunctionVJP(shDegreeToUse,
-                          gid,
+                          gidx,
                           c,
                           viewDir,
                           shNCoeffs,
@@ -446,7 +448,8 @@ computeShBackward(
             cooperative_groups::reduce(pairThreads, dLossDViewDir.z, cooperative_groups::plus<T>());
         if (pairThreads.thread_rank() == 0) {
             if (outDLossDMeans != nullptr) {
-                T *dLossDMean = outDLossDMeans + gaussianId * 3;
+                const int64_t outputIdx = gaussianId - offset;
+                T *dLossDMean           = outDLossDMeans + outputIdx * 3;
                 gpuAtomicAdd(dLossDMean, dLossDViewDir.x);
                 gpuAtomicAdd(dLossDMean + 1, dLossDViewDir.y);
                 gpuAtomicAdd(dLossDMean + 2, dLossDViewDir.z);
@@ -564,7 +567,8 @@ computeShDiffuseOnlyBackward(
         return;
     }
 
-    gpuAtomicAdd(&outDLossDSh0Coeffs[gid][0][c],
+    const auto outputIdx = eid % count;
+    gpuAtomicAdd(&outDLossDSh0Coeffs[outputIdx][0][c],
                  T(0.2820947917738781) * dLossDRenderQuantities[cid][gid][c]);
 }
 
@@ -892,264 +896,219 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
 
     using scalar_t = float;
 
-    const int *radiiPtr = hasRadii ? radii.data_ptr<int>() : nullptr;
-
-    const auto tensorOptions = dLossDRenderQuantities.options();
+    const int *radiiPtr           = hasRadii ? radii.data_ptr<int>() : nullptr;
+    const auto tensorOptions      = dLossDRenderQuantities.options();
+    torch::Tensor dLossDSh0Coeffs = torch::empty({N, 1, D}, tensorOptions);
+    torch::Tensor dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices;
     if (hasShNCoeffs && K > 1) {
-        torch::Tensor dLossDShNCoeffs = torch::empty_like(shNCoeffs);
-        torch::Tensor dLossDSh0Coeffs = torch::empty({N, 1, D}, tensorOptions);
-        torch::Tensor dLossDMeans;
-        torch::Tensor dLossDWorldToCamMatrices;
+        dLossDShNCoeffs = torch::empty({N, K - 1, D}, tensorOptions);
         if (computeDLossDMeans) {
             dLossDMeans = torch::empty_like(means);
         }
         if (computeDLossDWorldToCamMatrices) {
             dLossDWorldToCamMatrices = torch::zeros_like(worldToCamMatrices);
         }
-        if (N == 0) {
-            return std::make_tuple(
-                dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices);
-        }
-
-        std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
-        std::vector<torch::Tensor> dLossDWorldToCamMatricesLocals(c10::cuda::device_count());
-
-        // Discard and prefetch each output shard before zeroing it for accumulation.
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
-            prefetchStreams[deviceId] = c10::cuda::getStreamFromPool(false, deviceId);
-            auto prefetchStream       = prefetchStreams[deviceId];
-
-            cudaEvent_t prefetchEvent;
-            C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
-            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
-            C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStream, prefetchEvent));
-
-            int64_t elementOffset, elementCount;
-            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
-
-            if (computeDLossDWorldToCamMatrices) {
-                // Use the compute stream so the captured cleanup stream follows the kernels and
-                // reduction. Zeroing can overlap prefetching on the preparation stream.
-                dLossDWorldToCamMatricesLocals[deviceId] =
-                    makeLocalGradient(dLossDWorldToCamMatrices, deviceId, stream);
-            }
-
-            if (elementCount > 0) {
-                std::vector<void *> prefetchPtrs;
-                std::vector<size_t> prefetchSizes;
-
-                prefetchPtrs.emplace_back(dLossDSh0Coeffs.data_ptr<scalar_t>() +
-                                          elementOffset * dLossDSh0Coeffs.stride(0));
-                prefetchSizes.emplace_back(elementCount * dLossDSh0Coeffs.stride(0) *
-                                           sizeof(scalar_t));
-                prefetchPtrs.emplace_back(dLossDShNCoeffs.data_ptr<scalar_t>() +
-                                          elementOffset * dLossDShNCoeffs.stride(0));
-                prefetchSizes.emplace_back(elementCount * dLossDShNCoeffs.stride(0) *
-                                           sizeof(scalar_t));
-                if (computeDLossDMeans) {
-                    prefetchPtrs.emplace_back(dLossDMeans.data_ptr<scalar_t>() +
-                                              elementOffset * dLossDMeans.stride(0));
-                    prefetchSizes.emplace_back(elementCount * dLossDMeans.stride(0) *
-                                               sizeof(scalar_t));
-                }
-                memDiscardAndPrefetchBatchAsync(
-                    prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
-
-                // Discard invalidates the previous contents, so zero outputs after prefetching.
-                C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
-                C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
-                for (const auto i: c10::irange(prefetchPtrs.size())) {
-                    C10_CUDA_CHECK(cudaMemsetAsync(prefetchPtrs[i], 0, prefetchSizes[i], stream));
-                }
-            }
-            C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
-        }
-
-        // Launch kernels on every device before submitting camera-gradient output prefetches.
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-
-            int64_t elementOffset, elementCount;
-            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
-
-            if (elementCount > 0) {
-                const dim3 NUM_BLOCKS(GET_BLOCKS(elementCount * D, DEFAULT_BLOCK_DIM), C);
-                scalar_t *dLossDViewDirBlockSums        = nullptr;
-                scalar_t *reducedViewDirectionGradients = nullptr;
-                if (computeDLossDWorldToCamMatrices) {
-                    const size_t numBlockSumElements = C * NUM_BLOCKS.x * 3;
-                    const size_t numReducedElements  = C * 3;
-                    C10_CUDA_CHECK(cudaMallocAsync(&dLossDViewDirBlockSums,
-                                                   (numBlockSumElements + numReducedElements) *
-                                                       sizeof(scalar_t),
-                                                   stream));
-                    reducedViewDirectionGradients = dLossDViewDirBlockSums + numBlockSumElements;
-                }
-
-                computeShBackward<scalar_t><<<NUM_BLOCKS, DEFAULT_BLOCK_DIM, 0, stream>>>(
-                    elementOffset,
-                    elementCount,
-                    N,
-                    K,
-                    D,
-                    shDegreeToUse,
-                    means.data_ptr<scalar_t>(),
-                    worldToCamMatrices.data_ptr<scalar_t>(),
-                    nullptr,
-                    nullptr,
-                    shNCoeffs.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
-                    radiiPtr,
-                    dLossDRenderQuantities
-                        .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
-                    dLossDSh0Coeffs.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
-                    dLossDShNCoeffs.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
-                    computeDLossDMeans ? dLossDMeans.data_ptr<scalar_t>() : nullptr,
-                    nullptr,
-                    dLossDViewDirBlockSums);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-                if (computeDLossDWorldToCamMatrices) {
-                    FVDB_CUB_WRAPPER_ASYNC(stream,
-                                           reduceViewDirectionGradientBlockSums<scalar_t>,
-                                           dLossDViewDirBlockSums,
-                                           reducedViewDirectionGradients,
-                                           C,
-                                           NUM_BLOCKS.x);
-
-                    const auto viewMatrixBlocks = GET_BLOCKS(C, DEFAULT_BLOCK_DIM);
-                    viewDirectionGradientsToWorldToCamMatrices<scalar_t>
-                        <<<viewMatrixBlocks, DEFAULT_BLOCK_DIM, 0, stream>>>(
-                            0,
-                            C,
-                            worldToCamMatrices.data_ptr<scalar_t>(),
-                            reducedViewDirectionGradients,
-                            dLossDWorldToCamMatricesLocals[deviceId].data_ptr<scalar_t>());
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
-                    C10_CUDA_CHECK(cudaFreeAsync(dLossDViewDirBlockSums, stream));
-                }
-            }
-        }
-
-        if (computeDLossDWorldToCamMatrices) {
-            // Kernels write camera gradients to device-local buffers, allowing output prefetching
-            // to overlap. Reuse the preparation streams to preserve their waits and ordering.
-            std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count(), nullptr);
-            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-                const auto [elementOffset, elementCount] =
-                    deviceChunk(dLossDWorldToCamMatrices.numel(), deviceId);
-                if (elementCount == 0) {
-                    continue;
-                }
-
-                C10_CUDA_CHECK(cudaSetDevice(deviceId));
-                auto prefetchStream                  = prefetchStreams[deviceId];
-                std::vector<void *> prefetchPointers = {
-                    dLossDWorldToCamMatrices.data_ptr<scalar_t>() + elementOffset};
-                std::vector<size_t> prefetchSizes = {elementCount * sizeof(scalar_t)};
-                memDiscardAndPrefetchBatchAsync(
-                    prefetchPointers, prefetchSizes, deviceId, prefetchStream);
-
-                // The output copy waits on these events after the reduction has been queued.
-                C10_CUDA_CHECK(cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId],
-                                                        cudaEventDisableTiming));
-                C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
-            }
-
-            reduceGradientShards(dLossDWorldToCamMatricesLocals);
-            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-                if (outputPrefetchEvents[deviceId]) {
-                    C10_CUDA_CHECK(cudaSetDevice(deviceId));
-                    auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-                    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[deviceId]));
-                    C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
-                }
-            }
-            copyGradientShards<scalar_t>(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
-
-            // Enqueue frees after reduction and output copies, before merging the compute streams.
-            dLossDWorldToCamMatricesLocals.clear();
-        }
-        mergeStreams();
-
-        return std::make_tuple(
-            dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices);
-    } else {
-        torch::Tensor dLossDSh0Coeffs = torch::empty({N, 1, D}, tensorOptions);
-        torch::Tensor dLossDShNCoeffs;
-        torch::Tensor dLossDMeans;
-        torch::Tensor dLossDWorldToCamMatrices;
-        if (N == 0) {
-            return std::make_tuple(
-                dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices);
-        }
-
-        // Discard and prefetch each output shard before zeroing it for accumulation.
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto stream         = c10::cuda::getCurrentCUDAStream(deviceId);
-            auto prefetchStream = c10::cuda::getStreamFromPool(false, deviceId);
-
-            cudaEvent_t prefetchEvent;
-            C10_CUDA_CHECK(cudaEventCreateWithFlags(&prefetchEvent, cudaEventDisableTiming));
-            C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, stream));
-            C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStream, prefetchEvent));
-
-            int64_t elementOffset, elementCount;
-            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
-
-            if (elementCount > 0) {
-                std::vector<void *> prefetchPtrs;
-                std::vector<size_t> prefetchSizes;
-
-                prefetchPtrs.emplace_back(dLossDSh0Coeffs.data_ptr<scalar_t>() +
-                                          elementOffset * dLossDSh0Coeffs.stride(0));
-                prefetchSizes.emplace_back(elementCount * dLossDSh0Coeffs.stride(0) *
-                                           sizeof(scalar_t));
-                memDiscardAndPrefetchBatchAsync(
-                    prefetchPtrs, prefetchSizes, deviceId, prefetchStream);
-
-                // Discard invalidates the previous contents, so zero outputs after prefetching.
-                C10_CUDA_CHECK(cudaEventRecord(prefetchEvent, prefetchStream));
-                C10_CUDA_CHECK(cudaStreamWaitEvent(stream, prefetchEvent));
-                for (const auto i: c10::irange(prefetchPtrs.size())) {
-                    C10_CUDA_CHECK(cudaMemsetAsync(prefetchPtrs[i], 0, prefetchSizes[i], stream));
-                }
-            }
-            C10_CUDA_CHECK(cudaEventDestroy(prefetchEvent));
-        }
-
-        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-
-            int64_t elementOffset, elementCount;
-            std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
-
-            if (elementCount > 0) {
-                const auto NUM_BLOCKS = GET_BLOCKS(C * elementCount * D, DEFAULT_BLOCK_DIM);
-
-                computeShDiffuseOnlyBackward<scalar_t>
-                    <<<NUM_BLOCKS, DEFAULT_BLOCK_DIM, 0, stream>>>(
-                        elementOffset,
-                        elementCount,
-                        C,
-                        N,
-                        D,
-                        dLossDRenderQuantities
-                            .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
-                        radiiPtr,
-                        dLossDSh0Coeffs.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>());
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            }
-        }
-        mergeStreams();
-
+    }
+    if (N == 0) {
         return std::make_tuple(
             dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices);
     }
+
+    std::vector<cudaStream_t> prefetchStreams(c10::cuda::device_count());
+    std::vector<torch::Tensor> dLossDSh0CoeffsLocals(c10::cuda::device_count());
+    std::vector<torch::Tensor> dLossDShNCoeffsLocals(c10::cuda::device_count());
+    std::vector<torch::Tensor> dLossDMeansLocals(c10::cuda::device_count());
+    std::vector<torch::Tensor> dLossDWorldToCamMatricesLocals(c10::cuda::device_count());
+
+    // Preparation waits for prior work, but not for the local-gradient kernels below.
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto stream               = c10::cuda::getCurrentCUDAStream(deviceId);
+        prefetchStreams[deviceId] = c10::cuda::getStreamFromPool(false, deviceId);
+        cudaEvent_t event;
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(event, stream));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStreams[deviceId], event));
+        C10_CUDA_CHECK(cudaEventDestroy(event));
+    }
+
+    // Each GPU owns whole Gaussians. Allocate and zero only its output rows on that GPU.
+    // Launch every GPU before submitting managed-output prefetches.
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        int64_t elementOffset, elementCount;
+        std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
+        if (hasShNCoeffs && K > 1 && computeDLossDWorldToCamMatrices) {
+            // Every rank participates in the camera reduction, including empty Gaussian shards.
+            dLossDWorldToCamMatricesLocals[deviceId] =
+                makeLocalGradient(dLossDWorldToCamMatrices, deviceId, stream);
+        }
+        if (elementCount == 0) {
+            continue;
+        }
+
+        dLossDSh0CoeffsLocals[deviceId] = makeLocalGradient(
+            dLossDSh0Coeffs.narrow(0, elementOffset, elementCount), deviceId, stream);
+        if (hasShNCoeffs && K > 1) {
+            dLossDShNCoeffsLocals[deviceId] = makeLocalGradient(
+                dLossDShNCoeffs.narrow(0, elementOffset, elementCount), deviceId, stream);
+            if (computeDLossDMeans) {
+                dLossDMeansLocals[deviceId] = makeLocalGradient(
+                    dLossDMeans.narrow(0, elementOffset, elementCount), deviceId, stream);
+            }
+            const dim3 NUM_BLOCKS(GET_BLOCKS(elementCount * D, DEFAULT_BLOCK_DIM), C);
+            scalar_t *dLossDViewDirBlockSums        = nullptr;
+            scalar_t *reducedViewDirectionGradients = nullptr;
+            if (computeDLossDWorldToCamMatrices) {
+                const size_t numBlockSumElements = C * NUM_BLOCKS.x * 3;
+                const size_t numReducedElements  = C * 3;
+                C10_CUDA_CHECK(
+                    cudaMallocAsync(&dLossDViewDirBlockSums,
+                                    (numBlockSumElements + numReducedElements) * sizeof(scalar_t),
+                                    stream));
+                reducedViewDirectionGradients = dLossDViewDirBlockSums + numBlockSumElements;
+            }
+            const auto shNCoeffsShard = shNCoeffs.narrow(0, elementOffset, elementCount);
+            computeShBackward<scalar_t><<<NUM_BLOCKS, DEFAULT_BLOCK_DIM, 0, stream>>>(
+                elementOffset,
+                elementCount,
+                N,
+                K,
+                D,
+                shDegreeToUse,
+                means.data_ptr<scalar_t>(),
+                worldToCamMatrices.data_ptr<scalar_t>(),
+                nullptr,
+                nullptr,
+                shNCoeffsShard.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+                radiiPtr,
+                dLossDRenderQuantities.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+                dLossDSh0CoeffsLocals[deviceId]
+                    .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+                dLossDShNCoeffsLocals[deviceId]
+                    .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+                computeDLossDMeans ? dLossDMeansLocals[deviceId].data_ptr<scalar_t>() : nullptr,
+                nullptr,
+                dLossDViewDirBlockSums);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            if (computeDLossDWorldToCamMatrices) {
+                FVDB_CUB_WRAPPER_ASYNC(stream,
+                                       reduceViewDirectionGradientBlockSums<scalar_t>,
+                                       dLossDViewDirBlockSums,
+                                       reducedViewDirectionGradients,
+                                       C,
+                                       NUM_BLOCKS.x);
+                const auto viewMatrixBlocks = GET_BLOCKS(C, DEFAULT_BLOCK_DIM);
+                viewDirectionGradientsToWorldToCamMatrices<scalar_t>
+                    <<<viewMatrixBlocks, DEFAULT_BLOCK_DIM, 0, stream>>>(
+                        0,
+                        C,
+                        worldToCamMatrices.data_ptr<scalar_t>(),
+                        reducedViewDirectionGradients,
+                        dLossDWorldToCamMatricesLocals[deviceId].data_ptr<scalar_t>());
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                C10_CUDA_CHECK(cudaFreeAsync(dLossDViewDirBlockSums, stream));
+            }
+        } else {
+            const auto NUM_BLOCKS = GET_BLOCKS(C * elementCount * D, DEFAULT_BLOCK_DIM);
+            computeShDiffuseOnlyBackward<scalar_t><<<NUM_BLOCKS, DEFAULT_BLOCK_DIM, 0, stream>>>(
+                elementOffset,
+                elementCount,
+                C,
+                N,
+                D,
+                dLossDRenderQuantities.packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>(),
+                radiiPtr,
+                dLossDSh0CoeffsLocals[deviceId]
+                    .packed_accessor64<scalar_t, 3, torch::RestrictPtrTraits>());
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    }
+
+    // Prepare managed destinations while the kernels accumulate into local buffers.
+    std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        int64_t elementOffset, elementCount;
+        std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
+        std::vector<void *> prefetchPointers;
+        std::vector<size_t> prefetchSizes;
+        if (elementCount > 0) {
+            for (const auto &output: {dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans}) {
+                if (output.defined()) {
+                    prefetchPointers.emplace_back(output.data_ptr<scalar_t>() +
+                                                  elementOffset * output.stride(0));
+                    prefetchSizes.emplace_back(elementCount * output.stride(0) * sizeof(scalar_t));
+                }
+            }
+        }
+        if (hasShNCoeffs && K > 1 && computeDLossDWorldToCamMatrices) {
+            int64_t cameraOffset, cameraCount;
+            std::tie(cameraOffset, cameraCount) =
+                deviceChunk(dLossDWorldToCamMatrices.numel(), deviceId);
+            if (cameraCount > 0) {
+                prefetchPointers.emplace_back(dLossDWorldToCamMatrices.data_ptr<scalar_t>() +
+                                              cameraOffset);
+                prefetchSizes.emplace_back(cameraCount * sizeof(scalar_t));
+            }
+        }
+        memDiscardAndPrefetchBatchAsync(
+            prefetchPointers, prefetchSizes, deviceId, prefetchStreams[deviceId]);
+        C10_CUDA_CHECK(
+            cudaEventCreateWithFlags(&outputPrefetchEvents[deviceId], cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStreams[deviceId]));
+    }
+
+    if (hasShNCoeffs && K > 1 && computeDLossDWorldToCamMatrices) {
+        reduceGradientShards(dLossDWorldToCamMatricesLocals);
+    }
+    // Gaussian gradients need no cross-device reduction. Only publication waits for prefetch.
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
+        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[deviceId]));
+        C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
+        int64_t elementOffset, elementCount;
+        std::tie(elementOffset, elementCount) = deviceChunk(N, deviceId);
+        if (elementCount == 0) {
+            continue;
+        }
+        C10_CUDA_CHECK(cudaMemcpyAsync(dLossDSh0Coeffs.data_ptr<scalar_t>() +
+                                           elementOffset * dLossDSh0Coeffs.stride(0),
+                                       dLossDSh0CoeffsLocals[deviceId].data_ptr<scalar_t>(),
+                                       dLossDSh0CoeffsLocals[deviceId].numel() * sizeof(scalar_t),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream));
+        if (hasShNCoeffs && K > 1) {
+            C10_CUDA_CHECK(cudaMemcpyAsync(
+                dLossDShNCoeffs.data_ptr<scalar_t>() + elementOffset * dLossDShNCoeffs.stride(0),
+                dLossDShNCoeffsLocals[deviceId].data_ptr<scalar_t>(),
+                dLossDShNCoeffsLocals[deviceId].numel() * sizeof(scalar_t),
+                cudaMemcpyDeviceToDevice,
+                stream));
+        }
+        if (hasShNCoeffs && K > 1 && computeDLossDMeans) {
+            C10_CUDA_CHECK(cudaMemcpyAsync(dLossDMeans.data_ptr<scalar_t>() +
+                                               elementOffset * dLossDMeans.stride(0),
+                                           dLossDMeansLocals[deviceId].data_ptr<scalar_t>(),
+                                           dLossDMeansLocals[deviceId].numel() * sizeof(scalar_t),
+                                           cudaMemcpyDeviceToDevice,
+                                           stream));
+        }
+    }
+    if (hasShNCoeffs && K > 1 && computeDLossDWorldToCamMatrices) {
+        copyGradientShards<scalar_t>(dLossDWorldToCamMatricesLocals, dLossDWorldToCamMatrices);
+    }
+
+    // Owners enqueue frees on their allocation streams, after the output copies and before merge.
+    dLossDSh0CoeffsLocals.clear();
+    dLossDShNCoeffsLocals.clear();
+    dLossDMeansLocals.clear();
+    dLossDWorldToCamMatricesLocals.clear();
+    mergeStreams();
+    return std::make_tuple(dLossDSh0Coeffs, dLossDShNCoeffs, dLossDMeans, dLossDWorldToCamMatrices);
 }
 
 template <>
