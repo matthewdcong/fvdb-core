@@ -671,6 +671,13 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         }
     }
 
+    // Queue reductions before prefetch so a blocking host call cannot delay their launch.
+    reduceGradientShards(dMeansLocals);
+    reduceGradientShards(dQuatsLocals);
+    reduceGradientShards(dLogScalesLocals);
+    reduceGradientShards(dFeaturesLocals);
+    reduceGradientShards(dOpacitiesLocals);
+
     // Rasterization writes to device-local buffers, allowing output prefetching to overlap.
     // The prefetch streams already wait on the work preceding rasterization.
     const std::vector<torch::Tensor> outTensors = {
@@ -696,12 +703,6 @@ launchBackwardPrivateUse1(const torch::Tensor &means,
         C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
     }
 
-    // Queue every reduction before waiting so they can all overlap with output prefetching.
-    reduceGradientShards(dMeansLocals);
-    reduceGradientShards(dQuatsLocals);
-    reduceGradientShards(dLogScalesLocals);
-    reduceGradientShards(dFeaturesLocals);
-    reduceGradientShards(dOpacitiesLocals);
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);

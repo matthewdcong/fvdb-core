@@ -1282,6 +1282,15 @@ callRasterizeBackwardPrivateUse1(
         }
     }
 
+    // Queue reductions before prefetch so a blocking host call cannot delay their launch.
+    reduceGradientShards(outDLossDMeans2dLocals);
+    reduceGradientShards(outDLossDConicsLocals);
+    reduceGradientShards(outDLossDFeaturesLocals);
+    reduceGradientShards(outDLossDOpacitiesLocals);
+    if (absGrad) {
+        reduceGradientShards(outDLossDMeans2dAbsLocals);
+    }
+
     // Rasterization writes to device-local buffers prior to the cross-device reduction so it
     // can be overlapped with output prefetching.
     // The prefetch streams already wait on the work preceding rasterization.
@@ -1307,14 +1316,6 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
     }
 
-    // Queue every reduction before waiting so they can all overlap with output prefetching.
-    reduceGradientShards(outDLossDMeans2dLocals);
-    reduceGradientShards(outDLossDConicsLocals);
-    reduceGradientShards(outDLossDFeaturesLocals);
-    reduceGradientShards(outDLossDOpacitiesLocals);
-    if (absGrad) {
-        reduceGradientShards(outDLossDMeans2dAbsLocals);
-    }
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);

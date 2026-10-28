@@ -1027,7 +1027,12 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
         }
     }
 
-    // Prepare managed destinations while the kernels accumulate into local buffers.
+    // Queue reductions before prefetch so a blocking host call cannot delay their launch.
+    if (hasShNCoeffs && K > 1 && computeDLossDWorldToCamMatrices) {
+        reduceGradientShards(dLossDWorldToCamMatricesLocals);
+    }
+
+    // Prepare managed destinations while local computation and reductions run.
     std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -1061,9 +1066,6 @@ dispatchEvaluateSphericalHarmonicsBwd<torch::kPrivateUse1>(
         C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStreams[deviceId]));
     }
 
-    if (hasShNCoeffs && K > 1 && computeDLossDWorldToCamMatrices) {
-        reduceGradientShards(dLossDWorldToCamMatricesLocals);
-    }
     // Gaussian gradients need no cross-device reduction. Only publication waits for prefetch.
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));

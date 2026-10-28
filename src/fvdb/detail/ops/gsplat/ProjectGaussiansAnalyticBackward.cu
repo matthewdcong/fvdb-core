@@ -614,6 +614,11 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
             }
         }
 
+        // Queue reductions before prefetch so a blocking host call cannot delay their launch.
+        if (worldToCamMatricesRequiresGrad) {
+            reduceGradientShards(dLossDWorldToCamMatricesLocals);
+        }
+
         // Only whole Gaussian shards are copied back; their gradients need no reduction.
         // Managed-output preparation can overlap projection and the camera-gradient reduction.
         std::vector<cudaEvent_t> outputPrefetchEvents(c10::cuda::device_count());
@@ -650,9 +655,6 @@ dispatchProjectGaussiansAnalyticBwd<torch::kPrivateUse1>(
                 cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStreams[deviceId]));
         }
 
-        if (worldToCamMatricesRequiresGrad) {
-            reduceGradientShards(dLossDWorldToCamMatricesLocals);
-        }
         for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
             auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
