@@ -58,6 +58,7 @@ set(FVDB_CPP_FILES
 )
 
 set(FVDB_CU_FILES
+    fvdb/detail/utils/cuda/Prefetch.cu
     fvdb/GridBatchData.cu
     fvdb/GridStorage.cu
     fvdb/TorchDeviceBuffer.cu
