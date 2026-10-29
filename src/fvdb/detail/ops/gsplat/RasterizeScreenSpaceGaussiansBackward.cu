@@ -1160,8 +1160,8 @@ callRasterizeBackwardPrivateUse1(
     const auto reshapedDLossDRenderedAlphas =
         activeTiles.has_value() ? dLossDRenderedAlphas : dLossDRenderedAlphas.view({-1, 1});
 
-    // These managed outputs are populated from contiguous, device-local gradient shards after the
-    // raster kernels complete. Keep them contiguous so each device can publish one flat range.
+    // These contiguous managed outputs receive each device's reduced Gaussian slices after
+    // rasterization. Packed gradients retain flat output ownership.
     torch::Tensor outDLossDMeans2d   = torch::empty(means2d.sizes(), means2d.options());
     torch::Tensor outDLossDConics    = torch::empty(conics.sizes(), conics.options());
     torch::Tensor outDLossDFeatures  = torch::empty(features.sizes(), features.options());
@@ -1184,6 +1184,15 @@ callRasterizeBackwardPrivateUse1(
     // Sparse active-tile lists retain their flat partition; empty images need nonzero alignment.
     const int64_t tileAlignment = activeTiles.has_value() || tileCount == 0 ? 1 : tileExtentW;
 
+    DeviceLists deviceLists;
+    if constexpr (!IS_PACKED) {
+        deviceLists = makeDeviceLists(
+            means2d.size(0),
+            tilesPerCamera,
+            tileAlignment,
+            c10::cuda::device_count(),
+            activeTiles.has_value() ? std::make_optional(activeTiles.value().size(0)) : std::nullopt);
+    }
     std::vector<torch::Tensor> outputs = {
         outDLossDMeans2d, outDLossDConics, outDLossDFeatures, outDLossDOpacities};
     if (absGrad) {
@@ -1222,12 +1231,13 @@ callRasterizeBackwardPrivateUse1(
         std::tie(deviceTileOffset, deviceTileCount) =
             deviceAlignedChunk(tileAlignment, tileCount, deviceId);
 
-        outDLossDMeans2dLocals[deviceId]   = makeLocalGradient(means2d, deviceId, stream);
-        outDLossDConicsLocals[deviceId]    = makeLocalGradient(conics, deviceId, stream);
-        outDLossDFeaturesLocals[deviceId]  = makeLocalGradient(features, deviceId, stream);
-        outDLossDOpacitiesLocals[deviceId] = makeLocalGradient(opacities, deviceId, stream);
+        outDLossDMeans2dLocals[deviceId] = makeLocalGradient<IS_PACKED>(means2d, deviceId, stream);
+        outDLossDConicsLocals[deviceId] = makeLocalGradient<IS_PACKED>(conics, deviceId, stream);
+        outDLossDFeaturesLocals[deviceId] = makeLocalGradient<IS_PACKED>(features, deviceId, stream);
+        outDLossDOpacitiesLocals[deviceId] = makeLocalGradient<IS_PACKED>(opacities, deviceId, stream);
         if (absGrad) {
-            outDLossDMeans2dAbsLocals[deviceId] = makeLocalGradient(means2d, deviceId, stream);
+            outDLossDMeans2dAbsLocals[deviceId] =
+                makeLocalGradient<IS_PACKED>(means2d, deviceId, stream);
         }
 
         if (deviceTileCount) {
@@ -1322,43 +1332,27 @@ callRasterizeBackwardPrivateUse1(
         C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[deviceId], prefetchStream));
     }
 
-    if constexpr (!IS_PACKED) {
-        // Flat reduction shards can write ranges prefetched by other devices. Join every
-        // discard/prefetch before publication, without joining the compute streams.
-        C10_CUDA_CHECK(cudaSetDevice(0));
-        auto prefetchStream = prefetchStreams[0];
-        for (const auto deviceId: c10::irange(1, c10::cuda::device_count())) {
-            C10_CUDA_CHECK(cudaStreamWaitEvent(prefetchStream, outputPrefetchEvents[deviceId]));
-        }
-        C10_CUDA_CHECK(cudaEventRecord(outputPrefetchEvents[0], prefetchStream));
-    }
-
     // Queue every reduction before waiting so they can all overlap with output prefetching.
-    reduceGradientShards(outDLossDMeans2dLocals);
-    reduceGradientShards(outDLossDConicsLocals);
-    reduceGradientShards(outDLossDFeaturesLocals);
-    reduceGradientShards(outDLossDOpacitiesLocals);
+    reduceLocalGradients<IS_PACKED>(outDLossDMeans2dLocals, deviceLists);
+    reduceLocalGradients<IS_PACKED>(outDLossDConicsLocals, deviceLists);
+    reduceLocalGradients<IS_PACKED>(outDLossDFeaturesLocals, deviceLists);
+    reduceLocalGradients<IS_PACKED>(outDLossDOpacitiesLocals, deviceLists);
     if (absGrad) {
-        reduceGradientShards(outDLossDMeans2dAbsLocals);
+        reduceLocalGradients<IS_PACKED>(outDLossDMeans2dAbsLocals, deviceLists);
     }
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-        const auto prefetchEventIndex = IS_PACKED ? deviceId : 0;
-        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[prefetchEventIndex]));
-    }
-    // The shared completion event must remain valid until every copy stream has waited on it.
-    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, outputPrefetchEvents[deviceId]));
         C10_CUDA_CHECK(cudaEventDestroy(outputPrefetchEvents[deviceId]));
     }
 
-    copyGradientShards<ScalarType>(outDLossDMeans2dLocals, outDLossDMeans2d);
-    copyGradientShards<ScalarType>(outDLossDConicsLocals, outDLossDConics);
-    copyGradientShards<ScalarType>(outDLossDFeaturesLocals, outDLossDFeatures);
-    copyGradientShards<ScalarType>(outDLossDOpacitiesLocals, outDLossDOpacities);
+    copyLocalGradients<IS_PACKED>(outDLossDMeans2dLocals, outDLossDMeans2d);
+    copyLocalGradients<IS_PACKED>(outDLossDConicsLocals, outDLossDConics);
+    copyLocalGradients<IS_PACKED>(outDLossDFeaturesLocals, outDLossDFeatures);
+    copyLocalGradients<IS_PACKED>(outDLossDOpacitiesLocals, outDLossDOpacities);
     if (absGrad) {
-        copyGradientShards<ScalarType>(outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs);
+        copyLocalGradients<IS_PACKED>(outDLossDMeans2dAbsLocals, outDLossDMeans2dAbs);
     }
 
     // Enqueue frees after the reductions and output copies, before merging the compute streams.

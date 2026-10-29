@@ -4,76 +4,46 @@
 #ifndef FVDB_DETAIL_UTILS_CUDA_GRADIENTREDUCTION_H
 #define FVDB_DETAIL_UTILS_CUDA_GRADIENTREDUCTION_H
 
-#include <fvdb/detail/utils/cuda/LocalGradient.h>
-#include <fvdb/detail/utils/cuda/Utils.cuh>
-
-#include <torch/csrc/cuda/nccl.h>
 #include <torch/types.h>
 
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace fvdb::detail {
 
+// Lists of unique, sorted local CUDA device IDs, which also serve as NCCL ranks;
+// the caller determines what each list represents.
+using DeviceLists = std::vector<std::vector<c10::DeviceIndex>>;
+
+// Match rasterization's aligned, flattened tile partition. Sparse camera membership is not
+// available on the host: conservatively include every device with assigned active tiles.
+DeviceLists
+makeDeviceLists(int64_t numCameras,
+                   int64_t tilesPerCamera,
+                   int64_t tileAlignment,
+                   int64_t deviceCount,
+                   std::optional<int64_t> numActiveTiles = std::nullopt);
+
 // Reduce in place into each device's owned slice of its local gradient buffer.
-// Inputs must come from makeLocalGradient(), whose storage includes zeroed padding for equally
-// sized NCCL shards. The logical tensor shapes and deviceChunk() output ownership stay unchanged.
-inline void
-reduceGradientShards(const std::vector<torch::Tensor> &localGradients) {
-    const int64_t numElements = localGradients.front().numel();
-    if (numElements == 0) {
-        return;
-    }
-
-    const int64_t deviceCount       = c10::cuda::device_count();
-    const int64_t shardSize         = localGradientShardSize(numElements, deviceCount);
-    const int64_t paddedNumElements = shardSize * deviceCount;
-    std::vector<torch::Tensor> paddedGradients(deviceCount);
-    std::vector<torch::Tensor> reducedShards(deviceCount);
-    for (const auto deviceId: c10::irange(deviceCount)) {
-        const auto &localGradient = localGradients[deviceId];
-        TORCH_CHECK(
-            localGradient.storage_offset() == 0,
-            "Local gradient must start at the beginning of its storage; use makeLocalGradient()");
-        const size_t storageBytes = localGradient.storage().nbytes();
-        const size_t elementSize  = localGradient.element_size();
-        TORCH_CHECK(
-            storageBytes % elementSize == 0 &&
-                storageBytes / elementSize == static_cast<size_t>(paddedNumElements),
-            "Local gradient storage must match the padded reduction size; use makeLocalGradient()");
-        // Expose the allocation's zeroed tail without copying or changing the logical gradient.
-        paddedGradients[deviceId] = localGradient.as_strided({paddedNumElements}, {1});
-        reducedShards[deviceId] =
-            paddedGradients[deviceId].narrow(0, deviceId * shardSize, shardSize);
-    }
-
-    // NCCL supports in-place reduce-scatter when each receive buffer is its rank's input slice.
-    // Ranks with no logical elements still participate using their zero-filled padded slice.
-    torch::cuda::nccl::reduce_scatter(paddedGradients, reducedShards);
-}
-
-// Call after queuing the reductions on the current streams.
-// Keep the local gradient buffers alive until all output copies have been queued.
-template <typename ScalarType>
+// Inputs must come from makeLocalGradient<Flatten>(). Flatten uses deviceChunk(numel, rank);
+// otherwise each camera uses deviceChunk(N, rank) and requires its sorted contributor list.
+// Per-camera reduction uses NCCL reduce-scatter for all-device contributors; all other cameras'
+// send/recv transfers share one NCCL group. Noncontributors must have zero gradients for that camera.
+// Uses current CUDA streams; keep them unchanged until the local buffers have been released.
+// Calls sharing PyTorch's NCCL communicator cache must be serialized on the host.
+template <bool Flatten = true>
 void
-copyGradientShards(const std::vector<torch::Tensor> &localGradients,
-                   torch::Tensor &outputGradient) {
-    const int64_t numElements = localGradients.front().numel();
-    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
-        const auto [shardOffset, shardSize] = deviceChunk(numElements, deviceId);
-        if (shardSize == 0) {
-            continue;
-        }
+reduceLocalGradients(const std::vector<torch::Tensor> &localGradients,
+                     const DeviceLists &deviceLists = {});
 
-        C10_CUDA_CHECK(cudaSetDevice(deviceId));
-        auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
-        C10_CUDA_CHECK(
-            cudaMemcpyAsync(outputGradient.data_ptr<ScalarType>() + shardOffset,
-                            localGradients[deviceId].data_ptr<ScalarType>() + shardOffset,
-                            shardSize * sizeof(ScalarType),
-                            cudaMemcpyDeviceToDevice,
-                            stream));
-    }
-}
+// Publish each device's reduced slices using the same Flatten value as makeLocalGradient().
+// Call after queuing reductions and waiting for output discard/prefetch on the current streams.
+// Keep local gradient buffers alive until all output copies have been queued.
+template <bool Flatten = true>
+void
+copyLocalGradients(const std::vector<torch::Tensor> &localGradients,
+                   torch::Tensor outputGradient);
 
 } // namespace fvdb::detail
 

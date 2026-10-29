@@ -10,16 +10,16 @@
 #include <limits>
 
 namespace fvdb::detail {
+namespace {
 
 torch::Tensor
-makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaStream_t stream) {
+makeGradientStorage(const torch::Tensor &tensor,
+                    int64_t paddedNumElements,
+                    c10::DeviceIndex deviceId,
+                    cudaStream_t stream) {
     const c10::Device device(c10::kCUDA, deviceId);
     const auto options = tensor.options().device(device);
 
-    const int64_t numElements       = tensor.numel();
-    const int64_t deviceCount       = c10::cuda::device_count();
-    const int64_t shardSize         = localGradientShardSize(numElements, deviceCount);
-    const int64_t paddedNumElements = shardSize * deviceCount;
     TORCH_CHECK(paddedNumElements <= std::numeric_limits<int64_t>::max() / tensor.element_size(),
                 "Local gradient allocation size overflows int64_t");
     const size_t numBytes = paddedNumElements * tensor.element_size();
@@ -45,9 +45,42 @@ makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaSt
     if (paddedNumElements != 0) {
         C10_CUDA_CHECK(cudaMemsetAsync(ptr, 0, numBytes, stream));
     }
-    // Keep the padded allocation alive through a view with the original logical shape. Reduction
-    // may expose the zeroed tail with as_strided(), while kernels and output copies only see data.
-    return localGradient.narrow(0, 0, numElements).view(tensor.sizes());
+    return localGradient;
 }
+
+} // namespace
+
+template <bool Flatten>
+torch::Tensor
+makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaStream_t stream) {
+    const int64_t deviceCount = c10::cuda::device_count();
+    if constexpr (Flatten) {
+        const int64_t numElements       = tensor.numel();
+        const int64_t shardSize         = localGradientShardSize(numElements, deviceCount);
+        const int64_t paddedNumElements = shardSize * deviceCount;
+        // Keep the padded allocation alive through a view with the original logical shape.
+        return makeGradientStorage(tensor, paddedNumElements, deviceId, stream)
+            .narrow(0, 0, numElements)
+            .view(tensor.sizes());
+    } else {
+        TORCH_CHECK(tensor.dim() >= 2, "Camera gradients must have shape [C, N, ...]");
+        auto paddedSizes = tensor.sizes().vec();
+        paddedSizes[1] = localGradientShardSize(tensor.size(1), deviceCount) * deviceCount;
+        int64_t paddedNumElements = 1;
+        for (const auto size: paddedSizes) {
+            TORCH_CHECK(size == 0 || paddedNumElements <= std::numeric_limits<int64_t>::max() / size,
+                        "Local gradient allocation size overflows int64_t");
+            paddedNumElements *= size;
+        }
+        return makeGradientStorage(tensor, paddedNumElements, deviceId, stream)
+            .view(paddedSizes)
+            .narrow(1, 0, tensor.size(1));
+    }
+}
+
+template torch::Tensor
+makeLocalGradient<true>(const torch::Tensor &, c10::DeviceIndex, cudaStream_t);
+template torch::Tensor
+makeLocalGradient<false>(const torch::Tensor &, c10::DeviceIndex, cudaStream_t);
 
 } // namespace fvdb::detail
