@@ -33,7 +33,7 @@ TEST(GradientReductionValidationTest, RejectsNonzeroStorageOffset) {
     const auto gradient = torch::zeros({deviceCount + 1}, options).narrow(0, 1, deviceCount);
     const std::vector<torch::Tensor> localGradients(deviceCount, gradient);
     try {
-        fvdb::detail::reduceGradientShards(localGradients);
+        fvdb::detail::reduceLocalGradients(localGradients);
         FAIL() << "Expected a nonzero storage offset to be rejected";
     } catch (const c10::Error &error) {
         EXPECT_NE(std::string(error.what_without_backtrace()).find("beginning of its storage"),
@@ -57,7 +57,7 @@ TEST(GradientReductionValidationTest, RejectsIncorrectStorageSize) {
         const auto gradient = torch::zeros({storageElements}, options).narrow(0, 0, 1);
         const std::vector<torch::Tensor> localGradients(deviceCount, gradient);
         try {
-            fvdb::detail::reduceGradientShards(localGradients);
+            fvdb::detail::reduceLocalGradients(localGradients);
             FAIL() << "Expected incorrect padded storage size to be rejected";
         } catch (const c10::Error &error) {
             EXPECT_NE(std::string(error.what_without_backtrace())
@@ -103,7 +103,7 @@ TEST_P(GradientReductionTest, MatchesIndependentSumAndPreservesLogicalShape) {
         localGradients.emplace_back(std::move(gradient));
     }
 
-    fvdb::detail::reduceGradientShards(localGradients);
+    fvdb::detail::reduceLocalGradients(localGradients);
     for (const auto deviceId: c10::irange(deviceCount)) {
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         C10_CUDA_CHECK(cudaStreamSynchronize(streams[deviceId]));
@@ -139,5 +139,22 @@ INSTANTIATE_TEST_SUITE_P(ShapesAndStreams,
                                                               int64_t{1025}),
                                             ::testing::Values(torch::kFloat32, torch::kFloat64),
                                             ::testing::Bool()));
+
+TEST(DeviceListsTest, UsesActualAlignedTileRanges) {
+    using fvdb::detail::DeviceLists;
+    using fvdb::detail::makeDeviceLists;
+    EXPECT_EQ(makeDeviceLists(1, 24, 4, 2), (DeviceLists{{0, 1}}));
+    EXPECT_EQ(makeDeviceLists(2, 24, 4, 2), (DeviceLists{{0}, {1}}));
+    EXPECT_EQ(makeDeviceLists(2, 24, 4, 4), (DeviceLists{{0, 1}, {2, 3}}));
+    // A device's tile rows can straddle a camera boundary.
+    EXPECT_EQ(makeDeviceLists(2, 15, 3, 4), (DeviceLists{{0, 1}, {1, 2, 3}}));
+    EXPECT_EQ(makeDeviceLists(3, 10, 5, 2), (DeviceLists{{0}, {0, 1}, {1}}));
+    // Empty raster ranks, empty images, and one device all use the same partition rule.
+    EXPECT_EQ(makeDeviceLists(2, 1, 1, 4), (DeviceLists{{0}, {1}}));
+    EXPECT_EQ(makeDeviceLists(2, 0, 1, 4), (DeviceLists{{}, {}}));
+    EXPECT_EQ(makeDeviceLists(3, 24, 4, 1), (DeviceLists{{0}, {0}, {0}}));
+    // Sparse membership stays conservative, but devices with no active tiles are excluded.
+    EXPECT_EQ(makeDeviceLists(2, 24, 1, 4, 2), (DeviceLists{{0, 1}, {0, 1}}));
+}
 
 } // namespace

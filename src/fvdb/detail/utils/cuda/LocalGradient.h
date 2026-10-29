@@ -25,14 +25,17 @@ localGradientShardSize(int64_t numElements, int64_t deviceCount) {
     return (numElements + padding) / deviceCount;
 }
 
-/// @brief Create an owning, zeroed, contiguous CUDA tensor with the shape and dtype of tensor.
-/// Storage is rounded up to an equal number of elements per CUDA device, with a zeroed tail for
-/// reduceGradientShards(). The returned tensor retains the input's logical shape.
+/// @brief Create an owning, zeroed CUDA tensor with the shape and dtype of tensor.
+/// Flatten pads contiguous, flattened storage to equally sized element shards. Otherwise,
+/// pad the Gaussian dimension of each camera in [C, N, ...] to equally sized Gaussian shards;
+/// camera strides include this padding and must be honored by kernels. The logical shape stays
+/// unchanged. Use the same Flatten value for reduceLocalGradients().
 /// @note The caller must select deviceId and supply a stream on that device. Allocation, zeroing,
 /// and freeing use the supplied stream; all uses of the tensor must be ordered before its free on
 /// that stream. The last tensor owner must be released while the stream is still valid.
 /// Freeing the allocation leaves deviceId current; callers must select their device for later work.
 /// CUDA API calls are checked for errors.
+template <bool Flatten = true>
 torch::Tensor
 makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaStream_t stream);
 
