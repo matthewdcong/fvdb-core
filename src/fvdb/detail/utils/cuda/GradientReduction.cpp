@@ -8,9 +8,9 @@
 #include <torch/csrc/cuda/nccl.h>
 
 #include <algorithm>
-#include <iterator>
 #include <limits>
 #include <tuple>
+#include <utility>
 
 namespace fvdb::detail {
 namespace {
@@ -22,12 +22,11 @@ reduceFlattenedGradients(const std::vector<torch::Tensor> &localGradients) {
         return;
     }
 
-    const int64_t deviceCount       = c10::cuda::device_count();
-    const int64_t shardSize         = localGradientShardSize(numElements, deviceCount);
-    const int64_t paddedNumElements = shardSize * deviceCount;
-    std::vector<torch::Tensor> paddedGradients(deviceCount);
-    std::vector<torch::Tensor> reducedShards(deviceCount);
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    const int64_t shardSize = localGradientShardSize(numElements, c10::cuda::device_count());
+    const int64_t paddedNumElements = shardSize * c10::cuda::device_count();
+    std::vector<torch::Tensor> paddedGradients(c10::cuda::device_count());
+    std::vector<torch::Tensor> reducedShards(c10::cuda::device_count());
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         const auto &localGradient = localGradients[deviceId];
         TORCH_CHECK(
             localGradient.storage_offset() == 0,
@@ -49,19 +48,32 @@ reduceFlattenedGradients(const std::vector<torch::Tensor> &localGradients) {
     torch::cuda::nccl::reduce_scatter(paddedGradients, reducedShards);
 }
 
+struct GradientTransfer {
+    c10::DeviceIndex source;
+    c10::DeviceIndex destination;
+    torch::Tensor input;
+    torch::Tensor output;
+};
+
+struct GradientAccumulation {
+    c10::DeviceIndex deviceId;
+    torch::Tensor output;
+    torch::Tensor received;
+};
+
 void
 reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
                       const DeviceLists &deviceLists) {
-    const auto deviceCount = c10::cuda::device_count();
-    TORCH_CHECK(std::ssize(localGradients) == deviceCount && !localGradients.empty(),
+    TORCH_CHECK(static_cast<int64_t>(localGradients.size()) == c10::cuda::device_count() &&
+                    !localGradients.empty(),
                 "Camera gradients require one local buffer per CUDA device");
     const auto &first = localGradients.front();
-    TORCH_CHECK(first.dim() >= 2 && std::ssize(deviceLists) == first.size(0),
+    TORCH_CHECK(first.dim() >= 2 && static_cast<int64_t>(deviceLists.size()) == first.size(0),
                 "Camera contributors must match the [C, N, ...] gradient shape");
     for (const auto &sources: deviceLists) {
         c10::DeviceIndex previous = -1;
         for (const auto source: sources) {
-            TORCH_CHECK(source > previous && source < deviceCount,
+            TORCH_CHECK(source > previous && source < c10::cuda::device_count(),
                         "Camera contributors must be unique, sorted CUDA device IDs");
             previous = source;
         }
@@ -72,10 +84,10 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
 
     const int64_t numGaussians = first.size(1);
     const int64_t elementsPerGaussian = first.numel() / first.size(0) / numGaussians;
-    const int64_t shardSize = localGradientShardSize(numGaussians, deviceCount) *
+    const int64_t shardSize = localGradientShardSize(numGaussians, c10::cuda::device_count()) *
                               elementsPerGaussian;
-    const int64_t cameraSize = shardSize * deviceCount;
-    for (const auto deviceId: c10::irange(deviceCount)) {
+    const int64_t cameraSize = shardSize * c10::cuda::device_count();
+    for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         const auto &gradient = localGradients[deviceId];
         TORCH_CHECK(gradient.is_cuda() && gradient.get_device() == deviceId &&
                         gradient.sizes() == first.sizes() &&
@@ -91,14 +103,20 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
     // Reuse the device-ordered communicator cache used by PyTorch's collectives. Resolve it
     // before grouping transfers because a cache miss initializes the communicators.
     const auto comms = torch::cuda::nccl::detail::get_communicators(localGradients);
+    std::vector<GradientTransfer> transfers;
+    std::vector<GradientAccumulation> accumulations;
+
+    // Prepare all point-to-point transfers and receive buffers before entering the NCCL group.
+    // Cameras with contributions on every device use reduce-scatter directly.
     for (const auto cameraId: c10::irange(first.size(0))) {
         const auto &sources = deviceLists[cameraId];
         if (sources.empty()) {
             continue; // The zero-initialized local slices already hold this camera's result.
         }
-        if (std::ssize(sources) == deviceCount) {
-            std::vector<torch::Tensor> inputs(deviceCount), outputs(deviceCount);
-            for (const auto deviceId: c10::irange(deviceCount)) {
+        if (static_cast<int64_t>(sources.size()) == c10::cuda::device_count()) {
+            std::vector<torch::Tensor> inputs(c10::cuda::device_count());
+            std::vector<torch::Tensor> outputs(c10::cuda::device_count());
+            for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
                 inputs[deviceId] = localGradients[deviceId].as_strided(
                     {cameraSize}, {1}, cameraId * cameraSize);
                 outputs[deviceId] = inputs[deviceId].narrow(0, deviceId * shardSize, shardSize);
@@ -107,63 +125,71 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
             continue;
         }
 
-        std::vector<torch::Tensor> outputs(deviceCount), received(deviceCount);
-        for (const auto deviceId: c10::irange(deviceCount)) {
+        for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
             int64_t gaussianOffset, gaussianCount;
             std::tie(gaussianOffset, gaussianCount) = deviceChunk(numGaussians, deviceId);
             if (gaussianCount == 0) {
                 continue;
             }
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            outputs[deviceId] = localGradients[deviceId]
-                                    .select(0, cameraId)
-                                    .narrow(0, gaussianOffset, gaussianCount)
-                                    .view({-1});
-            // One contribution is already local or received straight into the output slice.
-            // Only the remaining contributions need separate receive buffers for summation.
-            received[deviceId] = torch::empty(
-                {std::ssize(sources) - 1, outputs[deviceId].numel()},
+            auto output = localGradients[deviceId]
+                              .select(0, cameraId)
+                              .narrow(0, gaussianOffset, gaussianCount)
+                              .view({-1});
+            auto received = torch::empty(
+                {static_cast<int64_t>(sources.size()) - 1, output.numel()},
                 localGradients[deviceId].options());
-        }
-        {
-            torch::cuda::nccl::AutoNcclGroup group;
-            for (const auto deviceId: c10::irange(deviceCount)) {
-                if (!outputs[deviceId].defined()) {
-                    continue;
+
+            // Start with this device's own contribution when present; otherwise receive the
+            // first source directly into output. Every other contribution goes into scratch.
+            const auto initialSource =
+                std::binary_search(sources.begin(), sources.end(), deviceId) ? deviceId
+                                                                            : sources.front();
+            int64_t receiveIndex = 0;
+            for (const auto source: sources) {
+                if (source == deviceId) {
+                    continue; // The local contribution is already in output.
                 }
-                int64_t gaussianOffset, gaussianCount;
-                std::tie(gaussianOffset, gaussianCount) = deviceChunk(numGaussians, deviceId);
-                bool hasContribution = std::binary_search(sources.begin(), sources.end(), deviceId);
-                int64_t receiveIndex = 0;
-                for (const auto source: sources) {
-                    if (source == deviceId) {
-                        continue;
-                    }
-                    auto input = localGradients[source]
-                                     .select(0, cameraId)
-                                     .narrow(0, gaussianOffset, gaussianCount)
-                                     .view({-1});
-                    auto output = hasContribution ? received[deviceId].select(0, receiveIndex++)
-                                                  : outputs[deviceId];
-                    hasContribution = true;
-                    C10_CUDA_CHECK(cudaSetDevice(source));
-                    auto stream = c10::cuda::getCurrentCUDAStream(source);
-                    torch::cuda::nccl::send(input, comms[source], stream, deviceId);
-                    C10_CUDA_CHECK(cudaSetDevice(deviceId));
-                    stream = c10::cuda::getCurrentCUDAStream(deviceId);
-                    torch::cuda::nccl::recv(output, comms[deviceId], stream, source);
-                }
+                auto input = localGradients[source]
+                                 .select(0, cameraId)
+                                 .narrow(0, gaussianOffset, gaussianCount)
+                                 .view({-1});
+                auto receiveBuffer = source == initialSource
+                                         ? output
+                                         : received.select(0, receiveIndex++);
+                transfers.push_back(
+                    {source, deviceId, std::move(input), std::move(receiveBuffer)});
             }
+            accumulations.push_back({deviceId, std::move(output), std::move(received)});
         }
-        // The group must finish enqueueing before CUDA consumers or receive-buffer releases.
-        for (const auto deviceId: c10::irange(deviceCount)) {
-            if (!outputs[deviceId].defined()) {
-                continue;
-            }
-            C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            for (const auto receiveIndex: c10::irange(received[deviceId].size(0))) {
-                outputs[deviceId].add_(received[deviceId].select(0, receiveIndex));
-            }
+    }
+
+    if (transfers.empty()) {
+        return;
+    }
+
+    {
+        // Group every camera's point-to-point transfers for this gradient tensor so different
+        // camera owners can send concurrently instead of launching one scatter per camera.
+        torch::cuda::nccl::AutoNcclGroup group;
+        for (auto &transfer: transfers) {
+            C10_CUDA_CHECK(cudaSetDevice(transfer.source));
+            auto stream = c10::cuda::getCurrentCUDAStream(transfer.source);
+            torch::cuda::nccl::send(
+                transfer.input, comms[transfer.source], stream, transfer.destination);
+            C10_CUDA_CHECK(cudaSetDevice(transfer.destination));
+            stream = c10::cuda::getCurrentCUDAStream(transfer.destination);
+            torch::cuda::nccl::recv(
+                transfer.output, comms[transfer.destination], stream, transfer.source);
+        }
+    }
+
+    // Accumulate on each destination's current stream after NCCL has enqueued every transfer.
+    // Keep all buffers alive until these additions have also been enqueued.
+    for (auto &accumulation: accumulations) {
+        C10_CUDA_CHECK(cudaSetDevice(accumulation.deviceId));
+        for (const auto receiveIndex: c10::irange(accumulation.received.size(0))) {
+            accumulation.output.add_(accumulation.received.select(0, receiveIndex));
         }
     }
 }

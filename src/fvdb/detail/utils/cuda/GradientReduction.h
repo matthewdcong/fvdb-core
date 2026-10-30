@@ -28,8 +28,8 @@ makeDeviceLists(int64_t numCameras,
 // Reduce in place into each device's owned slice of its local gradient buffer.
 // Inputs must come from makeLocalGradient<Flatten>(). Flatten uses deviceChunk(numel, rank);
 // otherwise each camera uses deviceChunk(N, rank) and requires its sorted contributor list.
-// Per-camera reduction uses NCCL reduce-scatter for all-device contributors and grouped send/recv
-// otherwise. Noncontributors must have zero local gradients for that camera.
+// Per-camera reduction uses NCCL reduce-scatter for all-device contributors; all other cameras'
+// send/recv transfers share one NCCL group. Noncontributors must have zero gradients for that camera.
 // Uses current CUDA streams; keep them unchanged until the local buffers have been released.
 // Calls sharing PyTorch's NCCL communicator cache must be serialized on the host.
 template <bool Flatten = true>
