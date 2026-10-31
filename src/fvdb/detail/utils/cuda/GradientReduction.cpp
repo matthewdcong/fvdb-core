@@ -61,15 +61,37 @@ struct GradientAccumulation {
     torch::Tensor received;
 };
 
+// Local cameras reuse their accumulation slice. All other cameras are stored in camera order
+// in the receive tail, omitting the local camera range.
+int64_t
+cameraGradientShardOffset(const torch::Tensor &gradient,
+                           int64_t firstCamera,
+                           int64_t cameraId,
+                           int64_t gaussianOffset,
+                           int64_t gaussianCount) {
+    const int64_t localCamera = cameraId - firstCamera;
+    if (localCamera >= 0 && localCamera < gradient.size(0)) {
+        return localCamera * gradient.stride(0) + gaussianOffset * gradient.stride(1);
+    }
+    const int64_t receiveCamera = cameraId < firstCamera ? cameraId : cameraId - gradient.size(0);
+    return gradient.size(0) * gradient.stride(0) +
+           receiveCamera * gaussianCount * gradient.stride(1);
+}
+
 void
 reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
-                      const DeviceLists &deviceLists) {
+                      const DeviceLists &deviceLists,
+                      const std::vector<int64_t> &cameraOffsets) {
     TORCH_CHECK(static_cast<int64_t>(localGradients.size()) == c10::cuda::device_count() &&
                     !localGradients.empty(),
                 "Camera gradients require one local buffer per CUDA device");
     const auto &first = localGradients.front();
-    TORCH_CHECK(first.dim() >= 2 && static_cast<int64_t>(deviceLists.size()) == first.size(0),
-                "Camera contributors must match the [C, N, ...] gradient shape");
+    TORCH_CHECK(first.dim() >= 2, "Camera gradients must have shape [C, N, ...]");
+    TORCH_CHECK(cameraOffsets.empty() || cameraOffsets.size() == localGradients.size(),
+                "Camera offsets must have one entry per CUDA device");
+    const int64_t numCameras = deviceLists.size();
+    TORCH_CHECK(first.size(0) <= numCameras,
+                "Camera contributors must cover the local gradient's camera dimension");
     for (const auto &sources: deviceLists) {
         c10::DeviceIndex previous = -1;
         for (const auto source: sources) {
@@ -78,26 +100,48 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
             previous = source;
         }
     }
-    if (first.numel() == 0) {
+    const int64_t numGaussians = first.size(1);
+    int64_t elementsPerGaussian = 1;
+    for (const auto dim: c10::irange(int64_t{2}, first.dim())) {
+        elementsPerGaussian *= first.size(dim);
+    }
+    if (numCameras == 0 || numGaussians == 0 || elementsPerGaussian == 0) {
         return;
     }
-
-    const int64_t numGaussians = first.size(1);
-    const int64_t elementsPerGaussian = first.numel() / first.size(0) / numGaussians;
     const int64_t shardSize = localGradientShardSize(numGaussians, c10::cuda::device_count()) *
                               elementsPerGaussian;
     const int64_t cameraSize = shardSize * c10::cuda::device_count();
     for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
         const auto &gradient = localGradients[deviceId];
+        const int64_t firstCamera = cameraOffsets.empty() ? 0 : cameraOffsets[deviceId];
         TORCH_CHECK(gradient.is_cuda() && gradient.get_device() == deviceId &&
-                        gradient.sizes() == first.sizes() &&
+                        gradient.dim() == first.dim() &&
+                        gradient.sizes().slice(1) == first.sizes().slice(1) &&
                         gradient.scalar_type() == first.scalar_type(),
-                    "Camera gradients must have matching shapes and dtypes on their CUDA devices");
+                    "Camera gradients must have matching Gaussian shapes and dtypes on their "
+                    "CUDA devices");
+        TORCH_CHECK(firstCamera >= 0 && firstCamera <= numCameras &&
+                        gradient.size(0) <= numCameras - firstCamera,
+                    "Local camera range must be within the global camera dimension");
+        int64_t gaussianCount;
+        std::tie(std::ignore, gaussianCount) = deviceChunk(numGaussians, deviceId);
+        const int64_t storageElements = gradient.size(0) * cameraSize +
+                                        (numCameras - gradient.size(0)) * gaussianCount *
+                                            elementsPerGaussian;
         TORCH_CHECK(gradient.storage_offset() == 0 && gradient.stride(0) == cameraSize &&
-                        gradient.select(0, 0).is_contiguous() &&
+                        gradient.stride(1) == elementsPerGaussian &&
+                        (gradient.size(0) == 0 || gradient.select(0, 0).is_contiguous()) &&
                         gradient.storage().nbytes() / gradient.element_size() ==
-                            static_cast<size_t>(first.size(0) * cameraSize),
+                            static_cast<size_t>(storageElements),
                     "Camera gradient storage must use makeLocalGradient<false>()");
+    }
+    for (const auto cameraId: c10::irange(numCameras)) {
+        for (const auto source: deviceLists[cameraId]) {
+            const int64_t firstCamera = cameraOffsets.empty() ? 0 : cameraOffsets[source];
+            TORCH_CHECK(cameraId >= firstCamera &&
+                            cameraId - firstCamera < localGradients[source].size(0),
+                        "Camera contributor must have a local accumulation buffer");
+        }
     }
 
     // Reuse the device-ordered communicator cache used by PyTorch's collectives. Resolve it
@@ -108,7 +152,7 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
 
     // Prepare all point-to-point transfers and receive buffers before entering the NCCL group.
     // Cameras with contributions on every device use reduce-scatter directly.
-    for (const auto cameraId: c10::irange(first.size(0))) {
+    for (const auto cameraId: c10::irange(numCameras)) {
         const auto &sources = deviceLists[cameraId];
         if (sources.empty()) {
             continue; // The zero-initialized local slices already hold this camera's result.
@@ -117,8 +161,9 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
             std::vector<torch::Tensor> inputs(c10::cuda::device_count());
             std::vector<torch::Tensor> outputs(c10::cuda::device_count());
             for (const auto deviceId: c10::irange(c10::cuda::device_count())) {
+                const int64_t firstCamera = cameraOffsets.empty() ? 0 : cameraOffsets[deviceId];
                 inputs[deviceId] = localGradients[deviceId].as_strided(
-                    {cameraSize}, {1}, cameraId * cameraSize);
+                    {cameraSize}, {1}, (cameraId - firstCamera) * cameraSize);
                 outputs[deviceId] = inputs[deviceId].narrow(0, deviceId * shardSize, shardSize);
             }
             torch::cuda::nccl::reduce_scatter(inputs, outputs);
@@ -132,10 +177,13 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
                 continue;
             }
             C10_CUDA_CHECK(cudaSetDevice(deviceId));
-            auto output = localGradients[deviceId]
-                              .select(0, cameraId)
-                              .narrow(0, gaussianOffset, gaussianCount)
-                              .view({-1});
+            const auto &gradient = localGradients[deviceId];
+            const int64_t firstCamera = cameraOffsets.empty() ? 0 : cameraOffsets[deviceId];
+            auto output = gradient.as_strided(
+                {gaussianCount * elementsPerGaussian},
+                {1},
+                cameraGradientShardOffset(
+                    gradient, firstCamera, cameraId, gaussianOffset, gaussianCount));
             auto received = torch::empty(
                 {static_cast<int64_t>(sources.size()) - 1, output.numel()},
                 localGradients[deviceId].options());
@@ -150,8 +198,9 @@ reduceCameraGradients(const std::vector<torch::Tensor> &localGradients,
                 if (source == deviceId) {
                     continue; // The local contribution is already in output.
                 }
+                const int64_t sourceFirstCamera = cameraOffsets.empty() ? 0 : cameraOffsets[source];
                 auto input = localGradients[source]
-                                 .select(0, cameraId)
+                                 .select(0, cameraId - sourceFirstCamera)
                                  .narrow(0, gaussianOffset, gaussianCount)
                                  .view({-1});
                 auto receiveBuffer = source == initialSource
@@ -214,16 +263,10 @@ makeDeviceLists(int64_t numCameras,
         int64_t tileOffset, deviceTileCount;
         std::tie(tileOffset, deviceTileCount) =
             deviceAlignedChunk(tileAlignment, tileCount, deviceId, deviceCount);
-        if (deviceTileCount == 0) {
-            continue;
-        }
-        for (const auto cameraId: c10::irange(numCameras)) {
-            const int64_t cameraBegin = cameraId * tilesPerCamera;
-            const int64_t cameraEnd   = cameraBegin + tilesPerCamera;
-            if (numActiveTiles ||
-                (tileOffset < cameraEnd && cameraBegin < tileOffset + deviceTileCount)) {
-                deviceLists[cameraId].push_back(deviceId);
-            }
+        const auto [firstCamera, cameraCount] = cameraRangeForTiles(
+            numCameras, tilesPerCamera, tileOffset, deviceTileCount, numActiveTiles.has_value());
+        for (const auto cameraId: c10::irange(firstCamera, firstCamera + cameraCount)) {
+            deviceLists[cameraId].push_back(deviceId);
         }
     }
     return deviceLists;
@@ -232,20 +275,24 @@ makeDeviceLists(int64_t numCameras,
 template <bool Flatten>
 void
 reduceLocalGradients(const std::vector<torch::Tensor> &localGradients,
-                     const DeviceLists &deviceLists) {
+                     const DeviceLists &deviceLists,
+                     const std::vector<int64_t> &cameraOffsets) {
     if constexpr (Flatten) {
         reduceFlattenedGradients(localGradients);
     } else {
-        reduceCameraGradients(localGradients, deviceLists);
+        reduceCameraGradients(localGradients, deviceLists, cameraOffsets);
     }
 }
 
 template <bool Flatten>
 void
 copyLocalGradients(const std::vector<torch::Tensor> &localGradients,
-                   torch::Tensor outputGradient) {
+                   torch::Tensor outputGradient,
+                   const std::vector<int64_t> &cameraOffsets) {
     if constexpr (!Flatten) {
         TORCH_CHECK(outputGradient.is_contiguous(), "Camera gradient outputs must be contiguous");
+        TORCH_CHECK(cameraOffsets.empty() || cameraOffsets.size() == localGradients.size(),
+                    "Camera offsets must have one entry per CUDA device");
     }
     if (outputGradient.numel() == 0) {
         return;
@@ -266,7 +313,9 @@ copyLocalGradients(const std::vector<torch::Tensor> &localGradients,
         C10_CUDA_CHECK(cudaSetDevice(deviceId));
         auto stream = c10::cuda::getCurrentCUDAStream(deviceId);
         auto *output = static_cast<char *>(outputGradient.data_ptr());
-        const auto *input = static_cast<const char *>(gradient.data_ptr());
+        // A device can have no local cameras but still own receive shards. Untyped data_ptr()
+        // returns null for an empty logical tensor, so address the owning allocation directly.
+        const auto *input = static_cast<const char *>(gradient.storage().data_ptr().get());
         if constexpr (Flatten) {
             C10_CUDA_CHECK(cudaMemcpyAsync(
                 output + shardOffset * elementSize,
@@ -276,13 +325,14 @@ copyLocalGradients(const std::vector<torch::Tensor> &localGradients,
                 stream));
         } else {
             const size_t outputPitch = outputGradient.stride(0) * elementSize;
-            const size_t inputPitch = gradient.stride(0) * elementSize;
             const size_t width = shardSize * outputGradient.stride(1) * elementSize;
             output += shardOffset * outputGradient.stride(1) * elementSize;
-            input += shardOffset * gradient.stride(1) * elementSize;
+            const int64_t firstCamera = cameraOffsets.empty() ? 0 : cameraOffsets[deviceId];
             for (const auto cameraId: c10::irange(outputGradient.size(0))) {
+                const int64_t inputOffset = cameraGradientShardOffset(
+                    gradient, firstCamera, cameraId, shardOffset, shardSize);
                 C10_CUDA_CHECK(cudaMemcpyAsync(output + cameraId * outputPitch,
-                                              input + cameraId * inputPitch,
+                                              input + inputOffset * elementSize,
                                               width,
                                               cudaMemcpyDeviceToDevice,
                                               stream));
@@ -292,12 +342,20 @@ copyLocalGradients(const std::vector<torch::Tensor> &localGradients,
 }
 
 template void
-reduceLocalGradients<true>(const std::vector<torch::Tensor> &, const DeviceLists &);
+reduceLocalGradients<true>(const std::vector<torch::Tensor> &,
+                           const DeviceLists &,
+                           const std::vector<int64_t> &);
 template void
-reduceLocalGradients<false>(const std::vector<torch::Tensor> &, const DeviceLists &);
+reduceLocalGradients<false>(const std::vector<torch::Tensor> &,
+                            const DeviceLists &,
+                            const std::vector<int64_t> &);
 template void
-copyLocalGradients<true>(const std::vector<torch::Tensor> &, torch::Tensor);
+copyLocalGradients<true>(const std::vector<torch::Tensor> &,
+                         torch::Tensor,
+                         const std::vector<int64_t> &);
 template void
-copyLocalGradients<false>(const std::vector<torch::Tensor> &, torch::Tensor);
+copyLocalGradients<false>(const std::vector<torch::Tensor> &,
+                          torch::Tensor,
+                          const std::vector<int64_t> &);
 
 } // namespace fvdb::detail

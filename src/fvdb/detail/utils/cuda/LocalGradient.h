@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 namespace fvdb::detail {
 
@@ -25,11 +26,15 @@ localGradientShardSize(int64_t numElements, int64_t deviceCount) {
     return (numElements + padding) / deviceCount;
 }
 
-/// @brief Create an owning, zeroed CUDA tensor with the shape and dtype of tensor.
+/// @brief Create an owning, zeroed CUDA gradient with tensor's dtype and optional camera compaction.
 /// Flatten pads contiguous, flattened storage to equally sized element shards. Otherwise,
 /// pad the Gaussian dimension of each camera in [C, N, ...] to equally sized Gaussian shards;
-/// camera strides include this padding and must be honored by kernels. The logical shape stays
-/// unchanged. Use the same Flatten value for reduceLocalGradients().
+/// camera strides include this padding and must be honored by kernels. numLocalCameras optionally
+/// limits the camera dimension; storage after the logical tensor holds this device's Gaussian
+/// shards for the remaining cameras. Those shards use the logical (unpadded) device shard size.
+/// The tail is ordered by global camera ID, omitting the contiguous local camera range. With
+/// no local cameras the logical tensor is empty, but its storage can still hold receive shards.
+/// Use the same Flatten value and camera offsets for reduction and output copies.
 /// @note The caller must select deviceId and supply a stream on that device. Allocation, zeroing,
 /// and freeing use the supplied stream; all uses of the tensor must be ordered before its free on
 /// that stream. The last tensor owner must be released while the stream is still valid.
@@ -37,7 +42,10 @@ localGradientShardSize(int64_t numElements, int64_t deviceCount) {
 /// CUDA API calls are checked for errors.
 template <bool Flatten = true>
 torch::Tensor
-makeLocalGradient(const torch::Tensor &tensor, c10::DeviceIndex deviceId, cudaStream_t stream);
+makeLocalGradient(const torch::Tensor &tensor,
+                  c10::DeviceIndex deviceId,
+                  cudaStream_t stream,
+                  std::optional<int64_t> numLocalCameras = std::nullopt);
 
 } // namespace fvdb::detail
 

@@ -4,12 +4,14 @@
 #include <fvdb/detail/utils/cuda/GradientReduction.h>
 #include <fvdb/detail/utils/cuda/LocalGradient.h>
 
+#include <ATen/ops/from_blob.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -200,6 +202,101 @@ TEST_P(GradientReductionTest, CameraShardsMatchIndependentSum) {
         EXPECT_EQ(padding.count_nonzero().item<int64_t>(), 0);
     }
     EXPECT_TRUE(torch::equal(actual, expected));
+}
+
+TEST(CompactCameraGradientTest, ReducesAndPublishesOnlyOwnedShards) {
+    const int deviceCount = c10::cuda::device_count();
+    if (deviceCount == 0) {
+        GTEST_SKIP() << "CUDA is required for gradient reduction tests";
+    }
+    const c10::cuda::CUDAGuard deviceGuard(0);
+    std::vector<c10::cuda::CUDAStream> streams;
+    for (const auto deviceId: c10::irange(deviceCount)) {
+        streams.emplace_back(c10::cuda::getStreamFromPool(false, deviceId));
+    }
+    const c10::cuda::CUDAMultiStreamGuard streamGuard(streams);
+    const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    using fvdb::detail::DeviceLists;
+    using fvdb::detail::makeDeviceLists;
+    const c10::DeviceIndex lastDevice = deviceCount - 1;
+    const std::vector<DeviceLists> layouts = {
+        makeDeviceLists(1, 16 * deviceCount, 4, deviceCount), // One camera shared by every GPU.
+        makeDeviceLists(2, 16 * deviceCount, 4, deviceCount), // Two cameras, including 2C/4GPU.
+        makeDeviceLists(2, 15, 3, deviceCount),              // A rank can straddle cameras.
+        makeDeviceLists(deviceCount, 16 * deviceCount, 4, deviceCount), // One camera per GPU.
+        DeviceLists{{lastDevice}, {}}, // Receive-only ranks and a camera with no contributors.
+        DeviceLists{{}}};              // Every rank has an empty logical accumulation tensor.
+
+    for (const auto &deviceLists: layouts) {
+        const int64_t numCameras = deviceLists.size();
+        for (const int64_t numGaussians: {int64_t{0}, int64_t{1}, int64_t{17}}) {
+            SCOPED_TRACE(numCameras);
+            SCOPED_TRACE(numGaussians);
+            constexpr int64_t numChannels = 3;
+            const int64_t shardSize = fvdb::detail::localGradientShardSize(numGaussians, deviceCount);
+            const auto shape = torch::zeros({}, options).expand({numCameras, numGaussians, numChannels});
+            auto expected = torch::zeros({numCameras, numGaussians, numChannels}, options);
+            // A managed CUDA output exercises the production copy helper from every device,
+            // including ranks whose logical accumulation tensor is empty but whose tail is not.
+            // Initialize it before queuing any GPU work for this case.
+            C10_CUDA_CHECK(cudaSetDevice(0));
+            void *outputData = nullptr;
+            C10_CUDA_CHECK(cudaMallocManaged(
+                &outputData, std::max<int64_t>(expected.numel(), 1) * sizeof(float)));
+            auto output = at::from_blob(
+                outputData,
+                expected.sizes(),
+                [](void *data) { C10_CUDA_CHECK(cudaFree(data)); },
+                options.device(torch::kCUDA, 0));
+            std::fill_n(static_cast<float *>(outputData),
+                        expected.numel(),
+                        std::numeric_limits<float>::quiet_NaN());
+            const auto values = torch::arange(numGaussians * numChannels, options)
+                                    .remainder(17)
+                                    .view({numGaussians, numChannels});
+            std::vector<int64_t> cameraOffsets(deviceCount, 0);
+            std::vector<torch::Tensor> localGradients(deviceCount);
+            for (const auto deviceId: c10::irange(deviceCount)) {
+                C10_CUDA_CHECK(cudaSetDevice(deviceId));
+                int64_t cameraCount = 0;
+                auto input = torch::zeros_like(expected);
+                for (const auto cameraId: c10::irange(numCameras)) {
+                    const auto &sources = deviceLists[cameraId];
+                    if (std::find(sources.begin(), sources.end(), deviceId) == sources.end()) {
+                        continue;
+                    }
+                    if (cameraCount == 0) {
+                        cameraOffsets[deviceId] = cameraId;
+                    }
+                    cameraCount = cameraId + 1 - cameraOffsets[deviceId];
+                    input.select(0, cameraId).copy_(values - 8 + 3 * deviceId + 5 * cameraId);
+                }
+                expected += input;
+                auto gradient = fvdb::detail::makeLocalGradient<false>(
+                    shape, deviceId, streams[deviceId], cameraCount);
+                const int64_t begin = std::min<int64_t>(deviceId * shardSize, numGaussians);
+                const int64_t end = std::min<int64_t>((deviceId + 1) * shardSize, numGaussians);
+                const int64_t storageElements =
+                    (cameraCount * shardSize * deviceCount + (numCameras - cameraCount) * (end - begin)) *
+                    numChannels;
+                ASSERT_EQ(gradient.size(0), cameraCount);
+                ASSERT_EQ(gradient.storage().nbytes(), storageElements * sizeof(float));
+                gradient.copy_(input.narrow(0, cameraOffsets[deviceId], cameraCount));
+                localGradients[deviceId] = std::move(gradient);
+            }
+
+            fvdb::detail::reduceLocalGradients<false>(localGradients, deviceLists, cameraOffsets);
+            fvdb::detail::copyLocalGradients<false>(localGradients, output, cameraOffsets);
+            // Exercise stream-ordered release after copies have been queued.
+            localGradients.clear();
+            for (const auto deviceId: c10::irange(deviceCount)) {
+                C10_CUDA_CHECK(cudaSetDevice(deviceId));
+                C10_CUDA_CHECK(cudaStreamSynchronize(streams[deviceId]));
+            }
+            C10_CUDA_CHECK(cudaSetDevice(0));
+            EXPECT_TRUE(torch::equal(output.cpu(), expected));
+        }
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(ShapesAndStreams,
