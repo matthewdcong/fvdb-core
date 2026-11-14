@@ -20,7 +20,7 @@ namespace {
 // Start with 50 us of pending work to reduce the idle-stream host submission cliff.
 constexpr int kPrefetchDelayMicroseconds = 50;
 
-__global__ void
+[[maybe_unused]] __global__ void
 prefetchDelayKernel() {
     // The device clock measures elapsed time independently of SM clock frequency. A single
     // __nanosleep call can return early, so check elapsed time before allowing prefetch to run.
@@ -45,7 +45,7 @@ memDiscardAndPrefetchBatchAsync(std::vector<void *> &prefetchPointers,
 
 #if (CUDART_VERSION < 13000)
     for (size_t i = 0; i < prefetchPointers.size(); ++i) {
-        prefetchDelayKernel<<<1, 1, 0, stream>>>();
+        // prefetchDelayKernel<<<1, 1, 0, stream>>>();
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         C10_CUDA_CHECK(nanovdb::util::cuda::memPrefetchAsync(
             prefetchPointers[i], prefetchSizes[i], deviceId, stream));
@@ -56,7 +56,7 @@ memDiscardAndPrefetchBatchAsync(std::vector<void *> &prefetchPointers,
     std::vector<size_t> prefetchLocationIndices    = {0};
 
     // Prepare all arguments before the delay launch to minimize the host gap before prefetch.
-    prefetchDelayKernel<<<1, 1, 0, stream>>>();
+    // prefetchDelayKernel<<<1, 1, 0, stream>>>();
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     C10_CUDA_CHECK(cudaMemDiscardAndPrefetchBatchAsync(prefetchPointers.data(),
                                                        prefetchSizes.data(),
